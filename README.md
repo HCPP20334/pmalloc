@@ -1,6 +1,11 @@
 # pmalloc
 
-Header-only, C++17, всё в `namespace pmalloc`. Подключайте `pmalloc.hpp` на Windows или `pmalloc_posix.hpp` на Linux/macOS. Линковать ничего не нужно.
+
+```
+Внимание! pmalloc_posix.hpp пока сырой и медленный
+
+```
+Header-only, C++17, всё в `namespace pmalloc`. Подключайте `pmalloc_win.hpp` на Windows или `pmalloc_posix.hpp` на Linux/macOS. Линковать ничего не нужно.
 
 ## Базовые функции
 
