@@ -1,4 +1,4 @@
-# pmalloc: использование
+# pmalloc
 
 Header-only, C++17, всё в `namespace pmalloc`. Подключайте `pmalloc.hpp` на Windows или `pmalloc_posix.hpp` на Linux/macOS. Линковать ничего не нужно.
 
