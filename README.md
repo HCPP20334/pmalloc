@@ -97,7 +97,73 @@ void operator delete[](void* p, std::size_t) noexcept { pmalloc::pm_free(p); }
 void operator delete(void* p, std::align_val_t) noexcept { pmalloc::pm_free(p); }
 void operator delete[](void* p, std::align_val_t) noexcept { pmalloc::pm_free(p); }
 ```
+# Использования как основного аллокатора в Rust
+```
+// создайте pmalloc_allocator.cpp рядом с main.rs
+// код
+#if defined(_WIN32)
+    #include "pmalloc_win.hpp"
+#else
+    #include "pmalloc_posix.hpp"
+#endif
 
+extern "C" {
+
+void* pm_c_alloc(size_t size, size_t align) {
+    if (align <= pmalloc::kAlign) {
+        return pmalloc::pm_malloc(size);
+    } else {
+        return pmalloc::pm_malloc_aligned(size, align);
+    }
+}
+
+void pm_c_dealloc(void* ptr, size_t size, size_t align) {
+    (void)size;
+    (void)align;
+    pmalloc::pm_free(ptr);
+}
+
+void* pm_c_realloc(void* ptr, size_t old_size, size_t new_size, size_t align) {
+    (void)old_size;
+    (void)align;
+    return pmalloc::pm_realloc(ptr, new_size);
+}
+
+}
+```
+потом использование в коде и для винды собери .lib /src/pmalloc_wrapper.cpp
+```
+// в коде
+use std::alloc::{GlobalAlloc, Layout}; 
+
+
+#[link(name = "pmalloc", kind = "static")]
+unsafe extern "C" {
+    fn pm_c_alloc(size: usize, align: usize) -> *mut u8;
+    fn pm_c_dealloc(ptr: *mut u8, size: usize, align: usize);
+    fn pm_c_realloc(ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8;
+}
+
+pub struct PahomAllocator;
+
+unsafe impl GlobalAlloc for PahomAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { pm_c_alloc(layout.size(), layout.align()) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { pm_c_dealloc(ptr, layout.size(), layout.align()) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe { pm_c_realloc(ptr, layout.size(), new_size, layout.align()) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: PahomAllocator = PahomAllocator;
+
+```
 Положите это ровно в одну `.cpp` в exe. Не мешайте с DLL, которые собраны со своим CRT и своим `new`: указатель от одного аллокатора нельзя освобождать другим.
 
 ## Правила и ограничения
