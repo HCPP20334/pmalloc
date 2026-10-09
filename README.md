@@ -130,6 +130,31 @@ void* pm_c_realloc(void* ptr, size_t old_size, size_t new_size, size_t align) {
 }
 
 }
+``` 
+
+```
+// build.rs рядом с Cargo.toml и добавьте в Cargo.toml cc
+// windows msvc
+fn main() {
+    println!("cargo:rerun-if-changed=../../cpp/pmalloc.cpp"); 
+    let status = std::process::Command::new("cl")
+        .args(&[
+            "/c",
+            "/O2",
+            "/Oi",
+            "/EHsc",
+            "/std:c++17",
+            "/DNDEBUG",
+            "../../cpp/pmalloc.cpp", 
+            "/Fppmalloc.obj",
+        ])
+        .status()
+        .expect("Failed to execute cl.exe. Are you running from MSVC Developer Command Prompt?");
+
+    assert!(status.success(), "C++ allocator compilation failed");
+    println!("cargo:rustc-link-search=native={}", std::env::current_dir().unwrap().display());
+    println!("cargo:rustc-link-lib=static=pmalloc");
+}
 ```
 потом использование в коде и для винды собери .lib /src/pmalloc_wrapper.cpp
 ```
