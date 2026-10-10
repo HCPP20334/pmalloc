@@ -98,7 +98,7 @@ void operator delete(void* p, std::align_val_t) noexcept { pmalloc::pm_free(p); 
 void operator delete[](void* p, std::align_val_t) noexcept { pmalloc::pm_free(p); }
 ```
 # Использования как основного аллокатора в Rust
-```
+```cpp
 // создайте pmalloc_allocator.cpp рядом с main.rs
 // код
 #if defined(_WIN32)
@@ -132,7 +132,7 @@ void* pm_c_realloc(void* ptr, size_t old_size, size_t new_size, size_t align) {
 }
 ``` 
 
-```
+```rust
 // build.rs рядом с Cargo.toml и добавьте в Cargo.toml cc
 // windows msvc
 fn main() {
@@ -157,7 +157,7 @@ fn main() {
 }
 ```
 потом использование в коде и для винды собери .lib /src/pmalloc_wrapper.cpp
-```
+```rust
 // в коде
 use std::alloc::{GlobalAlloc, Layout}; 
 
