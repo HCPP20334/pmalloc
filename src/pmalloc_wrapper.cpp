@@ -1,3 +1,12 @@
+/*
+
+pmalloc_wrapper.cpp
+
+to compile .lib
+Only Windows
+
+*/
+
 #include "pmalloc_win.hpp"
 
 extern "C" {
