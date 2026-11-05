@@ -281,3 +281,8 @@ static GLOBAL: PahomAllocator = PahomAllocator;
 | `kLargeHotBudget` | 16 МБ | Бюджет активных горячих страниц до сброса `MEM_RESET` |
 | `kLargeBucketBudget` | 4 МБ | Бюджет памяти на отдельный large-бакет |
 | `kLargePerBucketMax` | 512 | Максимальное число свободных сегментов в одном бакете |
+
+
+
+
+README.md помогал составлять Gemini 4 Argon
