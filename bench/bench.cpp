@@ -272,8 +272,16 @@ static void fragmentation() {
     std::printf("\n");
     for (void* p : keep) F(p);
 }
-
+#if defined(__clang__)
+    const char* COMPILER_INFO = "clang-cl";
+#elif defined(_MSC_VER)
+    // Чистый MSVC определяет только _MSC_VER
+    const char* COMPILER_INFO = "msvc-cl";
+#else
+    const char* COMPILER_INFO = "unknown-compiler";
+#endif
 int main(int argc, char** argv) {
+    std::printf("%s\n",COMPILER_INFO);
     unsigned hw = std::thread::hardware_concurrency();
     g_threads = hw >= 4 ? 4 : (hw ? (int)hw : 1);
     if (argc > 1) g_reps = std::max(1, std::atoi(argv[1]));        
