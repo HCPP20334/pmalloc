@@ -1,8 +1,8 @@
 // pmalloc - PahomEngine memory Allocator
-// created: 19:52 , 06.10.26
+// created: 19:52 , 06.10.26[cite: 2]
 
 #pragma once
-
+#pragma message("pmalloc_win.hpp v2 (bucket_cap) loaded")
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -25,10 +25,11 @@
 #define PM_STAT(x) ((void)0)
 #endif
 
+/// @brief Пространство имен кастомного аллокатора памяти pmalloc.
 namespace pmalloc {
 
 constexpr std::size_t kSegmentSize   = 64 * 1024;
-constexpr std::size_t kAlign         = 16;
+constexpr std::size_t kAlign         = 64;
 constexpr std::size_t kSmallMax      = 8 * 1024;
 constexpr std::size_t kNumClasses    = kSmallMax / kAlign;
 constexpr std::size_t kLargeClass    = kNumClasses;
@@ -40,37 +41,43 @@ constexpr std::size_t kLargePerBucket = 8;
 constexpr std::size_t kLargeCacheMax  = 128 * 1024 * 1024;
 constexpr std::size_t kLargeHotBudget = 16 * 1024 * 1024;
 constexpr std::uint32_t kFlagFresh    = 1u;
-constexpr std::uint32_t kFlagHot      = 2u;
+constexpr std::uint32_t kFlagHot      = 2u;           // минимум на бакет
+constexpr std::size_t kLargeBucketBudget = 4 * 1024 * 1024;
+constexpr std::size_t kLargePerBucketMax = 512;
 
+/// @brief Узел свободного блока памяти в связанном списке.
 struct FreeNode {
-    FreeNode* next;
+    FreeNode* next; ///< Указатель на следующий свободный узел.
 };
 
 struct ThreadHeap;
 
+/// @brief Сегмент памяти аллокатора.
 struct Segment {
-    std::uint32_t magic;
-    std::uint32_t size_class;
-    std::uint32_t block_size;
-    std::uint32_t reserved;
-    FreeNode*     free_list;
-    std::atomic<FreeNode*>   remote_free;
-    std::atomic<ThreadHeap*> owner;
-    std::size_t   used;
-    std::size_t   total_bytes;
-    Segment*      next;
+    std::uint32_t magic;         ///< Магическое число для проверки валидности сегмента.
+    std::uint32_t size_class;    ///< Класс размера блока.
+    std::uint32_t block_size;    ///< Размер одного блока в байтах.
+    std::uint32_t reserved;      ///< Зарезервированные флаги.
+    FreeNode*     free_list;     ///< Голова локального списка свободных блоков.
+    std::atomic<FreeNode*>   remote_free; ///< Список освобожденных из других потоков блоков.
+    std::atomic<ThreadHeap*> owner;       ///< Владелец сегмента (поток).
+    std::size_t   used;          ///< Количество используемых блоков.
+    std::size_t   total_bytes;   ///< Общий размер сегмента в байтах.
+    Segment*      next;          ///< Указатель на следующий сегмент в списке.
 };
 
+/// @brief Куча конкретного потока.
 struct ThreadHeap {
-    Segment* segments[kNumClasses]{};
-    Segment* active[kNumClasses]{};
+    Segment* segments[kNumClasses]{}; ///< Массив сегментов по классам размеров.
+    Segment* active[kNumClasses]{};   ///< Активные сегменты для быстрого выделения.
 #ifdef PM_STATS
-    std::uint64_t n_alloc  = 0;   
-    std::uint64_t n_free   = 0;   
-    std::uint64_t n_remote = 0;   
+    std::uint64_t n_alloc  = 0;   ///< Счетчик выделений памяти.
+    std::uint64_t n_free   = 0;   ///< Счетчик освобождений памяти.
+    std::uint64_t n_remote = 0;   ///< Счетчик межпоточных освобождений.
 #endif
 };
 
+/// @brief Выравнивает значение вверх до кратного параметра alignment.
 constexpr std::size_t align_up(std::size_t v, std::size_t a) noexcept {
     return (v + a - 1) & ~(a - 1);
 }
@@ -79,6 +86,7 @@ constexpr std::size_t kHeader = align_up(sizeof(Segment), kAlign);
 
 inline std::atomic<Segment*> g_abandoned{nullptr};
 
+/// @brief Возвращает системный размер страницы памяти.
 inline std::size_t page_size() noexcept {
     static const std::size_t ps = [] {
         SYSTEM_INFO si;
@@ -88,6 +96,7 @@ inline std::size_t page_size() noexcept {
     return ps;
 }
 
+/// @brief Возвращает системную гранулярность выделения памяти.
 inline std::size_t granularity() noexcept {
     static const std::size_t g = [] {
         SYSTEM_INFO si;
@@ -105,16 +114,19 @@ inline std::atomic<std::uint64_t> g_large_allocs{0};
 inline std::atomic<std::uint64_t> g_large_hits{0};   
 inline std::atomic<std::uint64_t> g_dead_alloc{0}, g_dead_free{0}, g_dead_remote{0};
 
+/// @brief Освобождает память, выделенную через ОС.
 inline void os_free(void* p, std::size_t bytes) noexcept {
     ::VirtualFree(p, 0, MEM_RELEASE);
     g_os_bytes.fetch_sub(bytes, std::memory_order_relaxed);
     g_os_unmaps.fetch_add(1, std::memory_order_relaxed);
 }
 
+/// @brief Дает подсказку ОС о том, что страница памяти больше не нужна.
 inline void os_advise_free(void* p, std::size_t bytes) noexcept {
     ::VirtualAlloc(p, bytes, MEM_RESET, PAGE_READWRITE);
 }
 
+/// @brief Выделяет выровненную сырую память через Windows API.
 inline void* os_alloc_aligned_raw(std::size_t bytes, std::size_t align) noexcept {
     if (granularity() % align == 0 || align % granularity() == 0) {
         if (align <= granularity()) {
@@ -134,6 +146,7 @@ inline void* os_alloc_aligned_raw(std::size_t bytes, std::size_t align) noexcept
     return nullptr;
 }
 
+/// @brief Выделяет выровненную память с обновлением глобальной статистики.
 inline void* os_alloc_aligned(std::size_t bytes, std::size_t align) noexcept {
     void* p = os_alloc_aligned_raw(bytes, align);
     if (!p) return nullptr;
@@ -145,16 +158,19 @@ inline void* os_alloc_aligned(std::size_t bytes, std::size_t align) noexcept {
     return p;
 }
 
+/// @brief Определяет класс размера для запрошенного объема байт.
 inline std::size_t classify(std::size_t size) noexcept {
     if (size == 0) return 0;
     if (size > kSmallMax) return kLargeClass;
     return (size + kAlign - 1) / kAlign - 1;
 }
 
+/// @brief Возвращает реальный размер блока для заданного индекса класса.
 inline std::size_t block_size_of(std::size_t ci) noexcept {
     return (ci + 1) * kAlign;
 }
 
+/// @brief Переносит освобожденные из других потоков блоки в локальный список сегмента.
 inline void drain(Segment* s) noexcept {
     FreeNode* r = s->remote_free.exchange(nullptr, std::memory_order_acquire);
     if (!r) return;
@@ -169,6 +185,7 @@ inline void drain(Segment* s) noexcept {
     s->used -= n;
 }
 
+/// @brief Освобождает кучу потока при его завершении.
 inline void heap_release(ThreadHeap& h) noexcept {
 #ifdef PM_STATS
     g_dead_alloc.fetch_add(h.n_alloc, std::memory_order_relaxed);
@@ -198,16 +215,19 @@ inline void heap_release(ThreadHeap& h) noexcept {
     }
 }
 
+/// @brief Обертка для локальной кучи потока (TLS).
 struct TlsHeap {
     ThreadHeap heap{};
     ~TlsHeap() noexcept { heap_release(heap); }
 };
 
+/// @brief Возвращает ссылку на кучу текущего потока.
 inline ThreadHeap& tls_heap() noexcept {
     thread_local TlsHeap t;
     return t.heap;
 }
 
+/// @brief Создает новый сегмент для кучи потока.
 inline Segment* segment_new(ThreadHeap& h, std::size_t ci) noexcept {
     std::size_t bs = block_size_of(ci);
     if (kHeader + bs > kSegmentSize) return nullptr;
@@ -237,6 +257,7 @@ inline Segment* segment_new(ThreadHeap& h, std::size_t ci) noexcept {
     return seg;
 }
 
+/// @brief Принимает заброшенные сегменты от завершившихся потоков.
 inline void adopt_abandoned(ThreadHeap& h) noexcept {
     Segment* list = g_abandoned.exchange(nullptr, std::memory_order_acquire);
     while (list) {
@@ -254,6 +275,7 @@ inline void adopt_abandoned(ThreadHeap& h) noexcept {
     }
 }
 
+/// @brief Ищет сегмент с доступными свободными блоками.
 inline Segment* find_segment(ThreadHeap& h, std::size_t ci) noexcept {
     for (Segment* s = h.segments[ci]; s; s = s->next) {
         if (!s->free_list) drain(s);
@@ -262,6 +284,7 @@ inline Segment* find_segment(ThreadHeap& h, std::size_t ci) noexcept {
     return nullptr;
 }
 
+/// @brief Пополняет или находит сегмент для выделения памяти заданного класса.
 inline Segment* refill(ThreadHeap& h, std::size_t ci) noexcept {
     Segment* s = find_segment(h, ci);
     if (!s) {
@@ -273,6 +296,7 @@ inline Segment* refill(ThreadHeap& h, std::size_t ci) noexcept {
     return s;
 }
 
+/// @brief Определяет указатель на сегмент по адресу блока памяти.
 inline Segment* segment_of(const void* p) noexcept {
     std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(p);
     std::uintptr_t base = addr & ~(static_cast<std::uintptr_t>(kSegmentSize) - 1);
@@ -281,31 +305,40 @@ inline Segment* segment_of(const void* p) noexcept {
     return seg;
 }
 
+/// @brief Вычисляет начало конкретного блока внутри сегмента.
 inline char* block_start(Segment* seg, void* p) noexcept {
     char* first = reinterpret_cast<char*>(seg) + kHeader;
     std::size_t off = static_cast<std::size_t>(static_cast<char*>(p) - first);
     return first + (off / seg->block_size) * seg->block_size;
 }
 
+/// @brief Бакет для кэширования крупных блоков памяти.
 struct LargeBucket {
-    std::atomic<int> lock{0};
-    Segment*         head  = nullptr;
-    std::size_t      count = 0;
+    std::atomic<int> lock{0}; ///< Блокировка доступа к бакету.
+    Segment*         head  = nullptr; ///< Голова списка сегментов.
+    std::size_t      count = 0;       ///< Количество сегментов в бакете.
 };
 
 inline LargeBucket g_large[kLargeBuckets];
 inline std::atomic<std::size_t> g_large_bytes{0};
 inline std::atomic<std::size_t> g_large_hot{0};
 
+/// @brief Захватывает мьютекс бакета крупных блоков.
 inline void bucket_lock(LargeBucket& b) noexcept {
     while (b.lock.exchange(1, std::memory_order_acquire)) {
     }
 }
-
+inline std::size_t bucket_cap(std::size_t total) noexcept {
+    std::size_t c = kLargeBucketBudget / total;
+    return c < kLargePerBucket ? kLargePerBucket
+                               : (c > kLargePerBucketMax ? kLargePerBucketMax : c);
+}
+/// @brief Освобождает мьютекс бакета крупных блоков.
 inline void bucket_unlock(LargeBucket& b) noexcept {
     b.lock.store(0, std::memory_order_release);
 }
 
+/// @brief Округляет размер крупного блока до стандартного значения бакета.
 inline std::size_t large_round(std::size_t n, std::size_t& idx) noexcept {
     if (n <= kLargeMinBucket) {
         idx = 0;
@@ -323,6 +356,7 @@ inline std::size_t large_round(std::size_t n, std::size_t& idx) noexcept {
     return k * step;
 }
 
+/// @brief Извлекает крупный блок из кэш-бакета.
 inline Segment* large_pop(std::size_t idx) noexcept {
     LargeBucket& b = g_large[idx];
     bucket_lock(b);
@@ -342,6 +376,7 @@ inline Segment* large_pop(std::size_t idx) noexcept {
     return s;
 }
 
+/// @brief Возвращает крупный блок в кэш или освобождает ОС.
 inline void large_release(Segment* seg) noexcept {
     std::size_t idx   = seg->block_size;
     std::size_t total = seg->total_bytes;
@@ -350,28 +385,23 @@ inline void large_release(Segment* seg) noexcept {
         os_free(seg, total);
         return;
     }
-
-    std::size_t ps = page_size();
-    bool hot = g_large_hot.load(std::memory_order_relaxed) + total <= kLargeHotBudget;
-    if (!hot && total > ps)
-        os_advise_free(reinterpret_cast<char*>(seg) + ps, total - ps);
-
     LargeBucket& b = g_large[idx];
     bucket_lock(b);
-    if (b.count >= kLargePerBucket) {
+    if (b.count >= bucket_cap(total)) {
         bucket_unlock(b);
         os_free(seg, total);
         return;
     }
-    seg->reserved = hot ? kFlagHot : 0;
+    seg->reserved = kFlagHot;
     seg->next     = b.head;
     b.head        = seg;
     b.count++;
     g_large_bytes.fetch_add(total, std::memory_order_relaxed);
-    if (hot) g_large_hot.fetch_add(total, std::memory_order_relaxed);
+    g_large_hot.fetch_add(total, std::memory_order_relaxed);
     bucket_unlock(b);
 }
 
+/// @brief Очищает неиспользуемую физическую память в кэше крупных блоков.
 inline void pm_large_trim() noexcept {
     std::size_t ps = page_size();
     for (std::size_t i = 0; i < kLargeBuckets; ++i) {
@@ -389,6 +419,7 @@ inline void pm_large_trim() noexcept {
     }
 }
 
+/// @brief Полностью освобождает кэш крупных блоков.
 inline void pm_large_release() noexcept {
     for (std::size_t i = 0; i < kLargeBuckets; ++i) {
         LargeBucket& b = g_large[i];
@@ -410,6 +441,7 @@ inline void pm_large_release() noexcept {
     }
 }
 
+/// @brief Выделяет крупный блок памяти.
 inline void* large_alloc(std::size_t size, std::size_t alignment) noexcept {
     std::size_t offset = align_up(kHeader, alignment);
     if (offset >= kSegmentSize) return nullptr;
@@ -440,6 +472,7 @@ inline void* large_alloc(std::size_t size, std::size_t alignment) noexcept {
     return static_cast<char*>(raw) + offset;
 }
 
+/// @brief Выделяет блок памяти заданного размера.
 inline void* pm_malloc(std::size_t size) noexcept {
     if (size == 0) size = 1;
     if (size > kSmallMax) return large_alloc(size, kAlign);
@@ -460,6 +493,7 @@ inline void* pm_malloc(std::size_t size) noexcept {
     return node;
 }
 
+/// @brief Возвращает полезный размер выделенного блока памяти.
 inline std::size_t pm_usable_size(void* p) noexcept {
     if (!p) return 0;
     Segment* seg = segment_of(p);
@@ -473,6 +507,7 @@ inline std::size_t pm_usable_size(void* p) noexcept {
     return static_cast<std::size_t>(end - static_cast<char*>(p));
 }
 
+/// @brief Освобождает выделенный блок памяти.
 inline void pm_free(void* p) noexcept {
     if (!p) return;
 
@@ -502,6 +537,7 @@ inline void pm_free(void* p) noexcept {
     }
 }
 
+/// @brief Выделяет память под массив с обнулением.
 inline void* pm_calloc(std::size_t n, std::size_t size) noexcept {
     if (size != 0 && n > SIZE_MAX / size) return nullptr;
     std::size_t total = n * size;
@@ -513,6 +549,7 @@ inline void* pm_calloc(std::size_t n, std::size_t size) noexcept {
     return p;
 }
 
+/// @brief Изменяет размер ранее выделенного блока памяти.
 inline void* pm_realloc(void* p, std::size_t new_size) noexcept {
     if (!p) return pm_malloc(new_size);
     if (new_size == 0) { pm_free(p); return nullptr; }
@@ -533,6 +570,7 @@ inline void* pm_realloc(void* p, std::size_t new_size) noexcept {
     return np;
 }
 
+/// @brief Выделяет выровненную память.
 inline void* pm_malloc_aligned(std::size_t size, std::size_t alignment) noexcept {
     if (alignment <= kAlign) return pm_malloc(size);
     if ((alignment & (alignment - 1)) != 0) return nullptr;
@@ -549,10 +587,12 @@ inline void* pm_malloc_aligned(std::size_t size, std::size_t alignment) noexcept
     return large_alloc(size, alignment);
 }
 
+/// @brief Освобождает выровненную память.
 inline void pm_free_aligned(void* p) noexcept {
     pm_free(p);
 }
 
+/// @brief Запускает сборку мусора и освобождение пустых сегментов.
 inline void pm_collect() noexcept {
     ThreadHeap& h = tls_heap();
     for (std::size_t ci = 0; ci < kNumClasses; ++ci) {
@@ -575,6 +615,7 @@ inline void pm_collect() noexcept {
     pm_large_trim();
 }
 
+/// @brief Глобальная статистика аллокатора.
 struct Stats {
     std::size_t   os_bytes;          
     std::size_t   os_peak_bytes;      
@@ -584,12 +625,12 @@ struct Stats {
     std::uint64_t os_unmaps;          
     std::uint64_t large_allocs;       
     std::uint64_t large_cache_hits;   
-    // PM_STATS only; totals of threads that already exited. Use pm_thread_stats() for live thread.
     std::uint64_t exited_allocs;
     std::uint64_t exited_frees;
     std::uint64_t exited_remote_frees;
 };
 
+/// @brief Возвращает текущую глобальную статистику аллокатора.
 inline Stats pm_stats() noexcept {
     Stats s{};
     s.os_bytes            = g_os_bytes.load(std::memory_order_relaxed);
@@ -606,18 +647,19 @@ inline Stats pm_stats() noexcept {
     return s;
 }
 
-
+/// @brief Статистика потока.
 struct ThreadStats {
-    std::size_t   segments;        // small segments owned by this thread
-    std::size_t   reserved_bytes;  // segments * kSegmentSize
-    std::size_t   live_blocks;     // blocks currently allocated
-    std::size_t   live_bytes;      // live_blocks * block size (rounded-up size, not requested size)
-    double        utilization;     // live_bytes / reserved_bytes, 0..1 (low = fragmentation / idle memory)
-    std::uint64_t allocs;          // PM_STATS only
-    std::uint64_t frees;           // PM_STATS only: frees into own segments
-    std::uint64_t remote_frees;    // PM_STATS only: frees this thread pushed to other threads
+    std::size_t   segments;        
+    std::size_t   reserved_bytes;  
+    std::size_t   live_blocks;     
+    std::size_t   live_bytes;      
+    double        utilization;     
+    std::uint64_t allocs;          
+    std::uint64_t frees;           
+    std::uint64_t remote_frees;    
 };
 
+/// @brief Возвращает статистику текущего потока.
 inline ThreadStats pm_thread_stats() noexcept {
     ThreadStats t{};
     ThreadHeap& h = tls_heap();
@@ -639,6 +681,7 @@ inline ThreadStats pm_thread_stats() noexcept {
     return t;
 }
 
+/// @brief Обёртка аллокатора для стандартных контейнеров C++.
 template <typename T>
 struct pmallocator_cpp {
     using value_type = T;

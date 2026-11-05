@@ -34,6 +34,7 @@ constexpr std::size_t kLargeCacheMax  = 128 * 1024 * 1024;
 constexpr std::size_t kLargeHotBudget = 16 * 1024 * 1024;
 constexpr std::uint32_t kFlagFresh    = 1u;
 constexpr std::uint32_t kFlagHot      = 2u;
+constexpr std::size_t kSegmentCacheMax = 64;
 
 struct FreeNode {
     FreeNode* next;
@@ -72,12 +73,19 @@ constexpr std::size_t kHeader = align_up(sizeof(Segment), kAlign);
 
 inline std::atomic<Segment*> g_abandoned{nullptr};
 
+struct SegmentCacheNode {
+    Segment* head;
+    std::atomic<std::size_t> count;
+    std::atomic<int> lock;
+};
+
+inline SegmentCacheNode g_seg_cache[kNumClasses];
+
 inline std::size_t page_size() noexcept {
     static const std::size_t ps = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
     return ps;
 }
 
-// Глобальные счетчики статистики (аналогично Windows-версии)
 inline std::atomic<std::size_t>   g_os_bytes{0};    
 inline std::atomic<std::size_t>   g_os_peak{0};    
 inline std::atomic<std::uint64_t> g_os_maps{0};      
@@ -113,7 +121,6 @@ inline void* os_alloc_aligned(std::size_t bytes, std::size_t align) noexcept {
     char* rawend = raw + len;
     if (rawend > tail) ::munmap(tail, static_cast<std::size_t>(rawend - tail));
     
-    // Обновляем статистику выделений памяти ОС
     std::size_t now = g_os_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
     std::size_t pk  = g_os_peak.load(std::memory_order_relaxed);
     while (now > pk && !g_os_peak.compare_exchange_weak(pk, now, std::memory_order_relaxed)) {
@@ -147,6 +154,32 @@ inline void drain(Segment* s) noexcept {
     s->used -= n;
 }
 
+inline Segment* segment_cache_pop(std::size_t ci) noexcept {
+    SegmentCacheNode& sc = g_seg_cache[ci];
+    while (sc.lock.exchange(1, std::memory_order_acquire)) {}
+    Segment* s = sc.head;
+    if (s) {
+        sc.head = s->next;
+        sc.count.fetch_sub(1, std::memory_order_relaxed);
+    }
+    sc.lock.store(0, std::memory_order_release);
+    return s;
+}
+
+inline void segment_cache_push(Segment* s, std::size_t ci) noexcept {
+    SegmentCacheNode& sc = g_seg_cache[ci];
+    while (sc.lock.exchange(1, std::memory_order_acquire)) {}
+    if (sc.count.load(std::memory_order_relaxed) >= kSegmentCacheMax) {
+        sc.lock.store(0, std::memory_order_release);
+        os_free(s, kSegmentSize);
+        return;
+    }
+    s->next = sc.head;
+    sc.head = s;
+    sc.count.fetch_add(1, std::memory_order_relaxed);
+    sc.lock.store(0, std::memory_order_release);
+}
+
 inline void heap_release(ThreadHeap& h) noexcept {
 #ifdef PM_STATS
     g_dead_alloc.fetch_add(h.n_alloc, std::memory_order_relaxed);
@@ -160,7 +193,7 @@ inline void heap_release(ThreadHeap& h) noexcept {
             Segment* next = s->next;
             drain(s);
             if (s->used == 0) {
-                os_free(s, kSegmentSize);
+                segment_cache_push(s, ci);
             } else {
                 s->owner.store(nullptr, std::memory_order_release);
                 Segment* head = g_abandoned.load(std::memory_order_relaxed);
@@ -187,13 +220,31 @@ inline ThreadHeap& tls_heap() noexcept {
 }
 
 inline Segment* segment_new(ThreadHeap& h, std::size_t ci) noexcept {
+    Segment* seg = segment_cache_pop(ci);
+    if (seg) {
+        seg->free_list = nullptr;
+        seg->used = 0;
+        seg->owner.store(&h, std::memory_order_relaxed);
+        std::size_t bs = seg->block_size;
+        std::size_t count = (kSegmentSize - kHeader) / bs;
+        char* start = static_cast<char*>(static_cast<void*>(seg)) + kHeader;
+        for (std::size_t k = count; k-- > 0;) {
+            auto* node = reinterpret_cast<FreeNode*>(start + k * bs);
+            node->next = seg->free_list;
+            seg->free_list = node;
+        }
+        seg->next      = h.segments[ci];
+        h.segments[ci] = seg;
+        return seg;
+    }
+
     std::size_t bs = block_size_of(ci);
     if (kHeader + bs > kSegmentSize) return nullptr;
 
     void* raw = os_alloc_aligned(kSegmentSize, kSegmentSize);
     if (!raw) return nullptr;
 
-    auto* seg = new (raw) Segment{};
+    seg = new (raw) Segment{};
     seg->magic       = kSegmentMagic;
     seg->size_class  = static_cast<std::uint32_t>(ci);
     seg->block_size  = static_cast<std::uint32_t>(bs);
@@ -221,10 +272,10 @@ inline void adopt_abandoned(ThreadHeap& h) noexcept {
         Segment* next = list->next;
         list->owner.store(&h, std::memory_order_release);
         drain(list);
+        std::size_t ci = list->size_class;
         if (list->used == 0) {
-            os_free(list, kSegmentSize);
+            segment_cache_push(list, ci);
         } else {
-            std::size_t ci = list->size_class;
             list->next     = h.segments[ci];
             h.segments[ci] = list;
         }
@@ -543,7 +594,7 @@ inline void pm_collect() noexcept {
                 if (prev) prev->next = next;
                 else      h.segments[ci] = next;
                 if (h.active[ci] == cur) h.active[ci] = nullptr;
-                os_free(cur, kSegmentSize);
+                segment_cache_push(cur, ci);
             } else {
                 prev = cur;
             }
