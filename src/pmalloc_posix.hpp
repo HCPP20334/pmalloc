@@ -1,10 +1,11 @@
-// pmalloc - PahomEngine memory Allocator
+// pmalloc - PahomEngine memory Allocator (POSIX / Linux / macOS)
 // created: 19:52 , 06.10.26
 
 #pragma once
 
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sched.h>
 
 #include <atomic>
 #include <cstddef>
@@ -12,16 +13,26 @@
 #include <cstring>
 #include <new>
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
 #ifdef PM_STATS
 #define PM_STAT(x) x
 #else
 #define PM_STAT(x) ((void)0)
 #endif
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#define PM_NOINLINE __declspec(noinline)
+#else
+#define PM_NOINLINE __attribute__((noinline))
+#endif
+
 namespace pmalloc {
 
 constexpr std::size_t kSegmentSize   = 64 * 1024;
-constexpr std::size_t kAlign         = 16;
+constexpr std::size_t kAlign         = 64;
 constexpr std::size_t kSmallMax      = 8 * 1024;
 constexpr std::size_t kNumClasses    = kSmallMax / kAlign;
 constexpr std::size_t kLargeClass    = kNumClasses;
@@ -31,10 +42,12 @@ constexpr std::size_t kLargeMinBucket = 16 * 1024;
 constexpr std::size_t kLargeBuckets   = 45;
 constexpr std::size_t kLargePerBucket = 8;
 constexpr std::size_t kLargeCacheMax  = 128 * 1024 * 1024;
-constexpr std::size_t kLargeHotBudget = 16 * 1024 * 1024;
+constexpr std::size_t kLargeHotBudget = 16 * 1024 * 1024;   // не используется (оставлено для совместимости с win)
 constexpr std::uint32_t kFlagFresh    = 1u;
 constexpr std::uint32_t kFlagHot      = 2u;
-constexpr std::size_t kSegmentCacheMax = 64;
+constexpr std::size_t kLargeBucketBudget = 4 * 1024 * 1024;   // целевой объём кэша на бакет
+constexpr std::size_t kLargePerBucketMax = 512;               // потолок числа блоков на бакет
+constexpr std::size_t kSegmentCacheBytes = 16 * 1024 * 1024;  // общий лимит кэша пустых малых сегментов
 
 struct FreeNode {
     FreeNode* next;
@@ -73,13 +86,15 @@ constexpr std::size_t kHeader = align_up(sizeof(Segment), kAlign);
 
 inline std::atomic<Segment*> g_abandoned{nullptr};
 
-struct SegmentCacheNode {
+// Выравниваем для предотвращения ложного разделения кэш-линий в многопоточной среде
+struct alignas(64) SegmentCacheNode {
     Segment* head;
     std::atomic<std::size_t> count;
     std::atomic<int> lock;
 };
 
 inline SegmentCacheNode g_seg_cache[kNumClasses];
+inline std::atomic<std::size_t> g_seg_cache_bytes{0};
 
 inline std::size_t page_size() noexcept {
     static const std::size_t ps = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
@@ -156,28 +171,54 @@ inline void drain(Segment* s) noexcept {
 
 inline Segment* segment_cache_pop(std::size_t ci) noexcept {
     SegmentCacheNode& sc = g_seg_cache[ci];
-    while (sc.lock.exchange(1, std::memory_order_acquire)) {}
+    while (sc.lock.exchange(1, std::memory_order_acquire)) {
+        sched_yield(); // Уступаем процессор, если блокировка занята
+    }
     Segment* s = sc.head;
     if (s) {
         sc.head = s->next;
         sc.count.fetch_sub(1, std::memory_order_relaxed);
+        g_seg_cache_bytes.fetch_sub(kSegmentSize, std::memory_order_relaxed);
     }
     sc.lock.store(0, std::memory_order_release);
     return s;
 }
 
 inline void segment_cache_push(Segment* s, std::size_t ci) noexcept {
-    SegmentCacheNode& sc = g_seg_cache[ci];
-    while (sc.lock.exchange(1, std::memory_order_acquire)) {}
-    if (sc.count.load(std::memory_order_relaxed) >= kSegmentCacheMax) {
-        sc.lock.store(0, std::memory_order_release);
+    if (g_seg_cache_bytes.fetch_add(kSegmentSize, std::memory_order_relaxed) + kSegmentSize
+        > kSegmentCacheBytes) {
+        g_seg_cache_bytes.fetch_sub(kSegmentSize, std::memory_order_relaxed);
         os_free(s, kSegmentSize);
         return;
+    }
+    SegmentCacheNode& sc = g_seg_cache[ci];
+    while (sc.lock.exchange(1, std::memory_order_acquire)) {
+        sched_yield();
     }
     s->next = sc.head;
     sc.head = s;
     sc.count.fetch_add(1, std::memory_order_relaxed);
     sc.lock.store(0, std::memory_order_release);
+}
+
+/// Возвращает ОС все сегменты из кэша пустых малых сегментов.
+inline void pm_segment_cache_release() noexcept {
+    for (std::size_t ci = 0; ci < kNumClasses; ++ci) {
+        SegmentCacheNode& sc = g_seg_cache[ci];
+        while (sc.lock.exchange(1, std::memory_order_acquire)) {
+            sched_yield();
+        }
+        Segment* list = sc.head;
+        sc.head = nullptr;
+        sc.count.store(0, std::memory_order_relaxed);
+        sc.lock.store(0, std::memory_order_release);
+        while (list) {
+            Segment* next = list->next;
+            g_seg_cache_bytes.fetch_sub(kSegmentSize, std::memory_order_relaxed);
+            os_free(list, kSegmentSize);
+            list = next;
+        }
+    }
 }
 
 inline void heap_release(ThreadHeap& h) noexcept {
@@ -219,20 +260,12 @@ inline ThreadHeap& tls_heap() noexcept {
     return t.heap;
 }
 
-inline Segment* segment_new(ThreadHeap& h, std::size_t ci) noexcept {
+PM_NOINLINE inline Segment* segment_new(ThreadHeap& h, std::size_t ci) noexcept {
     Segment* seg = segment_cache_pop(ci);
     if (seg) {
-        seg->free_list = nullptr;
-        seg->used = 0;
+        // Оптимизация: сегмент уже содержит готовый free_list, так как он попадает 
+        // в кэш только при used == 0. Не нужно пересобирать список в O(N).
         seg->owner.store(&h, std::memory_order_relaxed);
-        std::size_t bs = seg->block_size;
-        std::size_t count = (kSegmentSize - kHeader) / bs;
-        char* start = static_cast<char*>(static_cast<void*>(seg)) + kHeader;
-        for (std::size_t k = count; k-- > 0;) {
-            auto* node = reinterpret_cast<FreeNode*>(start + k * bs);
-            node->next = seg->free_list;
-            seg->free_list = node;
-        }
         seg->next      = h.segments[ci];
         h.segments[ci] = seg;
         return seg;
@@ -266,7 +299,7 @@ inline Segment* segment_new(ThreadHeap& h, std::size_t ci) noexcept {
     return seg;
 }
 
-inline void adopt_abandoned(ThreadHeap& h) noexcept {
+PM_NOINLINE inline void adopt_abandoned(ThreadHeap& h) noexcept {
     Segment* list = g_abandoned.exchange(nullptr, std::memory_order_acquire);
     while (list) {
         Segment* next = list->next;
@@ -291,7 +324,7 @@ inline Segment* find_segment(ThreadHeap& h, std::size_t ci) noexcept {
     return nullptr;
 }
 
-inline Segment* refill(ThreadHeap& h, std::size_t ci) noexcept {
+PM_NOINLINE inline Segment* refill(ThreadHeap& h, std::size_t ci) noexcept {
     Segment* s = find_segment(h, ci);
     if (!s) {
         adopt_abandoned(h);
@@ -316,7 +349,8 @@ inline char* block_start(Segment* seg, void* p) noexcept {
     return first + (off / seg->block_size) * seg->block_size;
 }
 
-struct LargeBucket {
+// Выравниваем кэш больших бакетов
+struct alignas(64) LargeBucket {
     std::atomic<int> lock{0};
     Segment*         head  = nullptr;
     std::size_t      count = 0;
@@ -328,7 +362,14 @@ inline std::atomic<std::size_t> g_large_hot{0};
 
 inline void bucket_lock(LargeBucket& b) noexcept {
     while (b.lock.exchange(1, std::memory_order_acquire)) {
+        sched_yield();
     }
+}
+
+inline std::size_t bucket_cap(std::size_t total) noexcept {
+    std::size_t c = kLargeBucketBudget / total;
+    return c < kLargePerBucket ? kLargePerBucket
+                               : (c > kLargePerBucketMax ? kLargePerBucketMax : c);
 }
 
 inline void bucket_unlock(LargeBucket& b) noexcept {
@@ -380,24 +421,19 @@ inline void large_release(Segment* seg) noexcept {
         return;
     }
 
-    std::size_t ps = page_size();
-    bool hot = g_large_hot.load(std::memory_order_relaxed) + total <= kLargeHotBudget;
-    if (!hot && total > ps)
-        os_advise_free(reinterpret_cast<char*>(seg) + ps, total - ps);
-
     LargeBucket& b = g_large[idx];
     bucket_lock(b);
-    if (b.count >= kLargePerBucket) {
+    if (b.count >= bucket_cap(total)) {
         bucket_unlock(b);
         os_free(seg, total);
         return;
     }
-    seg->reserved = hot ? kFlagHot : 0;
+    seg->reserved = kFlagHot;
     seg->next     = b.head;
     b.head        = seg;
     b.count++;
     g_large_bytes.fetch_add(total, std::memory_order_relaxed);
-    if (hot) g_large_hot.fetch_add(total, std::memory_order_relaxed);
+    g_large_hot.fetch_add(total, std::memory_order_relaxed);
     bucket_unlock(b);
 }
 
@@ -439,7 +475,7 @@ inline void pm_large_release() noexcept {
     }
 }
 
-inline void* large_alloc(std::size_t size, std::size_t alignment) noexcept {
+PM_NOINLINE inline void* large_alloc(std::size_t size, std::size_t alignment) noexcept {
     std::size_t offset = align_up(kHeader, alignment);
     if (offset >= kSegmentSize) return nullptr;
     std::size_t ps = page_size();
@@ -563,8 +599,8 @@ inline void* pm_realloc(void* p, std::size_t new_size) noexcept {
 }
 
 inline void* pm_malloc_aligned(std::size_t size, std::size_t alignment) noexcept {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) return nullptr;   // только степень двойки
     if (alignment <= kAlign) return pm_malloc(size);
-    if ((alignment & (alignment - 1)) != 0) return nullptr;
     if (size == 0) size = 1;
     if (size > SIZE_MAX - alignment) return nullptr;
 
@@ -594,13 +630,14 @@ inline void pm_collect() noexcept {
                 if (prev) prev->next = next;
                 else      h.segments[ci] = next;
                 if (h.active[ci] == cur) h.active[ci] = nullptr;
-                segment_cache_push(cur, ci);
+                os_free(cur, kSegmentSize);
             } else {
                 prev = cur;
             }
             cur = next;
         }
     }
+    pm_segment_cache_release();
     pm_large_trim();
 }
 
@@ -692,5 +729,134 @@ struct pmallocator_cpp {
     template <typename U>
     bool operator!=(const pmallocator_cpp<U>&) const noexcept { return false; }
 };
+namespace pptr {
+    constexpr uint64_t max_ptrs = 128;
 
+    inline std::atomic<uint64_t> id_counter{ 1 };
+
+    inline uint64_t set_id() {
+        return id_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    struct ptr_data {
+        std::array<std::atomic<void*>, max_ptrs>    addr{};
+        std::array<std::atomic<uint64_t>, max_ptrs> id_ptr{};
+    };
+
+    inline ptr_data ps;
+
+    inline thread_local uint64_t tls_start_idx = 0;
+
+    inline std::atomic<void*> garbage_head{nullptr};
+
+    inline void flush_garbage() {
+        void* curr = garbage_head.exchange(nullptr, std::memory_order_acquire);
+        while (curr) {
+            void* next = *static_cast<void**>(curr);
+            pm_free(curr);
+            curr = next;
+        }
+    }
+
+    template <typename T>
+    struct handle {
+        T* p = nullptr;
+        uint64_t idx = 0;
+        uint64_t id = 0;
+
+        bool valid() const {
+            return p && id != 0 &&
+                ps.id_ptr[idx].load(std::memory_order_acquire) == id &&
+                ps.addr[idx].load(std::memory_order_acquire) == static_cast<void*>(p);
+        }
+
+        T* get() const {
+            return valid() ? p : nullptr;
+        }
+
+        T* operator->() const {
+            T* r = get();
+            if (!r) {
+                #ifdef _WIN32
+                std::fprintf(stderr, "pptr: UAF detected [ idx=%llu id=%llu, freed from %p ]\n", idx, id, _ReturnAddress());
+                #else
+                std::fprintf(stderr, "pptr: UAF detected [ idx=%llu id=%llu, freed from %p ]\n", idx, id, __builtin_return_address(0));
+                #endif
+                std::printf("abort()!\n");
+                std::abort();
+            }
+            return r;
+        }
+        
+        explicit operator bool() const { return valid(); }
+        bool operator==(std::nullptr_t) const { return !valid(); }
+        bool operator!=(std::nullptr_t) const { return valid(); }
+    };
+
+    template <typename T, typename... Args>
+    handle<T> ptr(Args&&... args) {
+        void* mem = pm_malloc(sizeof(T));
+        if (!mem) return {};
+
+        uint64_t start = tls_start_idx;
+
+        for (uint64_t i = start; i < start + max_ptrs; ++i) {
+            uint64_t k = i % max_ptrs;
+            
+            if (ps.addr[k].load(std::memory_order_relaxed) != nullptr) continue;
+
+            void* expected = nullptr;
+            if (ps.addr[k].compare_exchange_strong(expected, mem, std::memory_order_acq_rel)) {
+                T* obj;
+                try {
+                    obj = new (mem) T(std::forward<Args>(args)...);
+                }
+                catch (...) {
+                    ps.addr[k].store(nullptr, std::memory_order_release);
+                    pm_free(mem);
+                    throw;
+                }
+                
+                uint64_t id = set_id();
+                ps.id_ptr[k].store(id, std::memory_order_release);
+                
+                tls_start_idx = (k + 1) % max_ptrs;
+                
+                return { obj, k, id };
+            }
+        }
+        pm_free(mem);
+        return {};
+    }
+
+    template <typename T>
+    bool del(handle<T>& h, uint8_t is_nullptr_set = 0, uint8_t is_collect = 0) {
+        if (!h.p) return false;
+        uint64_t expected = h.id;
+        
+        if (!ps.id_ptr[h.idx].compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {
+            return false;
+        }
+            
+        T* obj = h.p;
+        
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            obj->~T();
+        }
+        
+        ps.addr[h.idx].store(nullptr, std::memory_order_release);
+        
+        void* mem = static_cast<void*>(obj);
+        void** node = static_cast<void**>(mem);
+        void* old_head = garbage_head.load(std::memory_order_relaxed);
+        do {
+            *node = old_head;
+        } while (!garbage_head.compare_exchange_weak(old_head, mem, std::memory_order_release, std::memory_order_relaxed));
+        
+        if (is_collect) pm_collect();
+        if (is_nullptr_set) h = {};
+        
+        return true;
+    }
+}
 }

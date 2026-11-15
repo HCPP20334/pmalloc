@@ -1,8 +1,8 @@
 // pmalloc - PahomEngine memory Allocator
-// created: 19:52 , 06.10.26[cite: 2]
+// created: 19:52 , 06.10.26
 
 #pragma once
-#pragma message("pmalloc_win.hpp v2 (bucket_cap) loaded")
+#pragma message("pmalloc_win.hpp v 0.654 (release)")
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <array>
 
 
 #ifdef PM_STATS
@@ -708,5 +709,148 @@ struct pmallocator_cpp {
     template <typename U>
     bool operator!=(const pmallocator_cpp<U>&) const noexcept { return false; }
 };
+template <typename T, typename... Args>
+[[nodiscard("Warn! ptr no returning!!")]] T* pm_new(Args&&... args) {
+    void* raw = pm_malloc(sizeof(T)); // allocate raw memory 
+    if (!raw) return nullptr;         // return nullptr if allocation failed
+
+    return new (raw) T(std::forward<Args>(args)...); // placement new: construct object in-place
+}
+template <typename T>
+void pm_delete(T*& ptr, uint8_t is_nullptr_set = 0, uint8_t is_collect = 0) {
+    if (!ptr) return;                 // check if pointer is valid
+    ptr->~T();                        // explicitly call the destructor
+    pm_free(ptr);                     // free memory back to pmalloc
+    if (is_collect) pm_collect();
+    if (is_nullptr_set) ptr = nullptr;                     // set nullptr 
+}
+#include <array>
+#include <immintrin.h>
+namespace pptr {
+    constexpr uint64_t max_ptrs = 128;
+
+    inline std::atomic<uint64_t> id_counter{ 1 };
+
+    inline uint64_t set_id() {
+        return id_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    struct ptr_data {
+        std::array<std::atomic<void*>, max_ptrs>    addr{};
+        std::array<std::atomic<uint64_t>, max_ptrs> id_ptr{};
+    };
+
+    inline ptr_data ps;
+
+    inline thread_local uint64_t tls_start_idx = 0;
+
+    inline std::atomic<void*> garbage_head{nullptr};
+
+    inline void flush_garbage() {
+        void* curr = garbage_head.exchange(nullptr, std::memory_order_acquire);
+        while (curr) {
+            void* next = *static_cast<void**>(curr);
+            pm_free(curr);
+            curr = next;
+        }
+    }
+
+    template <typename T>
+    struct handle {
+        T* p = nullptr;
+        uint64_t idx = 0;
+        uint64_t id = 0;
+
+        bool valid() const {
+            return p && id != 0 &&
+                ps.id_ptr[idx].load(std::memory_order_acquire) == id &&
+                ps.addr[idx].load(std::memory_order_acquire) == static_cast<void*>(p);
+        }
+
+        T* get() const {
+            return valid() ? p : nullptr;
+        }
+
+        T* operator->() const {
+            T* r = get();
+            if (!r) {
+                std::fprintf(stderr, "pptr: UAF detected [ idx=%llu id=%llu, freed from %p ]\n", idx, id, _ReturnAddress());
+                std::printf("abort()!\n");
+                std::abort();
+            }
+            return r;
+        }
+        
+        explicit operator bool() const { return valid(); }
+        bool operator==(std::nullptr_t) const { return !valid(); }
+        bool operator!=(std::nullptr_t) const { return valid(); }
+    };
+
+    template <typename T, typename... Args>
+    handle<T> ptr(Args&&... args) {
+        void* mem = pm_malloc(sizeof(T));
+        if (!mem) return {};
+
+        uint64_t start = tls_start_idx;
+
+        for (uint64_t i = start; i < start + max_ptrs; ++i) {
+            uint64_t k = i % max_ptrs;
+            
+            if (ps.addr[k].load(std::memory_order_relaxed) != nullptr) continue;
+
+            void* expected = nullptr;
+            if (ps.addr[k].compare_exchange_strong(expected, mem, std::memory_order_acq_rel)) {
+                T* obj;
+                try {
+                    obj = new (mem) T(std::forward<Args>(args)...);
+                }
+                catch (...) {
+                    ps.addr[k].store(nullptr, std::memory_order_release);
+                    pm_free(mem);
+                    throw;
+                }
+                
+                uint64_t id = set_id();
+                ps.id_ptr[k].store(id, std::memory_order_release);
+                
+                tls_start_idx = (k + 1) % max_ptrs;
+                
+                return { obj, k, id };
+            }
+        }
+        pm_free(mem);
+        return {};
+    }
+
+    template <typename T>
+    bool del(handle<T>& h, uint8_t is_nullptr_set = 0, uint8_t is_collect = 0) {
+        if (!h.p) return false;
+        uint64_t expected = h.id;
+        
+        if (!ps.id_ptr[h.idx].compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {
+            return false;
+        }
+            
+        T* obj = h.p;
+        
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            obj->~T();
+        }
+        
+        ps.addr[h.idx].store(nullptr, std::memory_order_release);
+        
+        void* mem = static_cast<void*>(obj);
+        void** node = static_cast<void**>(mem);
+        void* old_head = garbage_head.load(std::memory_order_relaxed);
+        do {
+            *node = old_head;
+        } while (!garbage_head.compare_exchange_weak(old_head, mem, std::memory_order_release, std::memory_order_relaxed));
+        
+        if (is_collect) pm_collect();
+        if (is_nullptr_set) h = {};
+        
+        return true;
+    }
+}
 
 }
