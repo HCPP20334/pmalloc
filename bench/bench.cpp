@@ -28,9 +28,9 @@
 
 #if defined(USE_PM)
 #if defined(_WIN32)
-#include "pmalloc_win.hpp"
+#include "../src/pmalloc_win.hpp"
 #else
-#include "pmalloc_posix.hpp"
+#include "../src/pmalloc_posix.hpp"
 #endif
 #define NAME "pmalloc"
 NOINLINE static void* A(size_t n) { return pmalloc::pm_malloc(n); }
