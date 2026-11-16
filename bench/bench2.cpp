@@ -20,11 +20,11 @@
 #include <vector>
 
 #if defined(_WIN32)
-#include "pmalloc_win.hpp"
+#include "../src/pmalloc_win.hpp"
 #else
-#include "pmalloc_posix.hpp"
+#include "../src/pmalloc_posix.hpp"
 #endif
-#include "pmalloc_x3d.hpp"
+#include "../src/pmalloc_x3d.hpp"
 
 #if defined(_MSC_VER)
 #define NOINLINE __declspec(noinline)
