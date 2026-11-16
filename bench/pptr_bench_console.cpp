@@ -1,8 +1,8 @@
 // Console runner for pptr_bench.hpp
 //
-//   Windows (clang-cl): clang-cl /O2 /MT /std:c++17 /DNDEBUG /arch:AVX2 pptr_bench_console.cpp /Fepptr_bench.exe
-//   Windows (MSVC):     cl /O2 /MT /std:c++17 /EHsc /DNDEBUG pptr_bench_console.cpp /Fepptr_bench.exe
-//   Linux:              g++ -O2 -mavx2 -pthread -std=c++17 -DNDEBUG pptr_bench_console.cpp -o pptr_bench
+//   Windows (clang-cl): clang-cl /O2 /MT /std:c++20 /DNDEBUG /arch:AVX2 pptr_bench_console.cpp /Fepptr_bench.exe
+//   Windows (MSVC):     cl /O2 /MT /std:c++20 /EHsc /DNDEBUG pptr_bench_console.cpp /Fepptr_bench.exe
+//   Linux:              g++ -O2 -mavx2 -pthread -std=c++20 -DNDEBUG pptr_bench_console.cpp -o pptr_bench
 //
 //   usage: pptr_bench [reps=5] [threads=0(auto)] [race_ms=1000]
 //
@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
 
     std::fputs(pptr_bench_report().c_str(), stdout);
 
-    // non-zero exit if reads were torn, handy for CI: a closed window must give 0
-    return pptrbench::st().torn.load() ? 1 : 0;
+    // non-zero exit if a PINNED read was torn (handy for CI: with pin_guard the window must be closed).
+    // Unpinned torn reads are expected and do not fail the run.
+    return pptrbench::st().torn_pin.load() ? 1 : 0;
 }

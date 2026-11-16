@@ -12,6 +12,8 @@
 //   4. batch create N / del N
 //   5. N threads: ptr+del pairs, shared read through h-> vs raw
 //   6. race canary: readers pass valid() while a writer deletes the object. Counts "torn" reads.
+//   7. (if the header defines PPTR_HAS_PIN_GUARD) the same traversals / shared reads / race through pin_guard.
+//      The pinned race must report 0 torn reads; the process exit code of the console runner depends on it.
 //
 // Assumes handle<T> has public members p / idx / id (as in your pptr). The pptr header is
 //   -DPPTR_BENCH_HEADER=\"...\"   (default: pmalloc_win.hpp on Windows, pmalloc_posix.hpp elsewhere)
@@ -51,7 +53,7 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
-
+#define PPTR_HAS_PIN_GUARD // safe mode 
 #ifndef PPTR_BENCH_HEADER
 #if defined(_WIN32)
 #define PPTR_BENCH_HEADER "pmalloc_win.hpp"
@@ -100,6 +102,13 @@ struct Canary {
 };
 using CH = pp::handle<Canary>;
 
+#ifdef PPTR_HAS_PIN_GUARD
+constexpr int kPin = 1;
+#else
+constexpr int kPin = 0;
+#endif
+constexpr int kHold = 32;   // barriers a reader keeps the object in use (race canary), same for pinned and not
+
 // ------------------------------------------------------------------ shared UI state
 struct Row {
     std::string name, extra;
@@ -112,7 +121,7 @@ struct State {
     std::vector<std::string> notes;
     std::string current, compiler;
     std::atomic<bool> running{false}, finished{false}, cancel{false};
-    std::atomic<uint64_t> torn{0}, fails{0};
+    std::atomic<uint64_t> torn{0}, torn_pin{0}, pin_checks{0}, fails{0};
     std::atomic<int> step{0}, total{1};
     int reps = 5, threads = 4, race_ms = 1000;
     std::thread worker;
@@ -177,6 +186,18 @@ PPB_NOINLINE inline double trav_arrow(const H* h, const uint32_t* ord, size_t n,
     for (size_t k = 0; k < inner; ++k) { PPB_BARRIER(); for (size_t i = 0; i < n; ++i) sum += h[ord[i]]->v[0]; }
     double d = secs(t); g_sink = sum; return d;
 }
+
+#ifdef PPTR_HAS_PIN_GUARD
+PPB_NOINLINE inline double trav_pin(const H* h, const uint32_t* ord, size_t n, size_t inner, size_t& ops) {
+    uint64_t sum = 0; ops = n * inner;
+    auto t = clk::now();
+    for (size_t k = 0; k < inner; ++k) {
+        PPB_BARRIER();
+        for (size_t i = 0; i < n; ++i) { pp::pin_guard<Obj> g(h[ord[i]]); sum += g ? g->v[0] : 0; }
+    }
+    double d = secs(t); g_sink = sum; return d;
+}
+#endif
 
 // ------------------------------------------------------------------ create / destroy
 inline double t_pairs_pp(size_t n, size_t& ops) {
@@ -257,6 +278,20 @@ inline double t_shared_arrow(const std::vector<H>& hs, size_t touches, size_t& o
         g_sink = sum;
     });
 }
+#ifdef PPTR_HAS_PIN_GUARD
+inline double t_shared_pin(const std::vector<H>& hs, size_t touches, size_t& ops) {
+    int nt = st().threads; size_t n = hs.size(), rounds = std::max<size_t>(1, touches / n);
+    ops = rounds * n * size_t(nt);
+    return run_threads(nt, [&, rounds, n](int) {
+        uint64_t sum = 0;
+        for (size_t r = 0; r < rounds; ++r) {
+            PPB_BARRIER();
+            for (size_t i = 0; i < n; ++i) { pp::pin_guard<Obj> g(hs[i]); sum += g ? g->v[0] : 0; }
+        }
+        g_sink = sum;
+    });
+}
+#endif
 inline double t_shared_raw(const std::vector<Obj*>& rs, size_t touches, size_t& ops) {
     int nt = st().threads; size_t n = rs.size(), rounds = std::max<size_t>(1, touches / n);
     ops = rounds * n * size_t(nt);
@@ -289,10 +324,12 @@ inline void run(const std::string& name, const std::function<double(size_t&)>& f
 }
 
 // ------------------------------------------------------------------ race canary
-// Readers copy the published handle, pass valid() through get(), then read the object.
-// The writer deletes the object right after publishing it. A reader that passed valid() and
-// then saw a destroyed (0xDEAD) or recycled block is a "torn" read: the TOCTOU window is real.
-inline void race_test(int ms, int readers) {
+// Readers copy the published handle, then either pass valid() through get() (unpinned) or take a
+// pin_guard (pinned), and read the object twice: right away and after a short hold (kHold barriers).
+// The writer deletes the object right after publishing it. A reader that got the object and then saw
+// a destroyed (0xDEAD) or recycled block is a "torn" read: the check-then-use window is real.
+// Unpinned: torn reads are expected. Pinned: torn reads must be 0.
+inline void race_test(int ms, int readers, bool pinned) {
     State& S = st();
     struct alignas(64) Ctr { uint64_t checks = 0, stale = 0, torn = 0; };
     std::vector<Ctr> ctr(static_cast<size_t>(readers));
@@ -310,7 +347,7 @@ inline void race_test(int ms, int readers) {
             pub_idx.store(uint64_t(h.idx), std::memory_order_release);
             pub_id.store(uint64_t(h.id), std::memory_order_release);
             for (int k = 0; k < 200; ++k) PPB_BARRIER();   // keep it valid for a short while
-            pp::del(h);
+            pp::del(h);                                     // pinned: waits until the readers let go
             ++replaced;
         }
         pub_p.store(0, std::memory_order_release);
@@ -322,15 +359,31 @@ inline void race_test(int ms, int readers) {
         rd.emplace_back([&, i] {
             Ctr& c = ctr[size_t(i)];
             while (!stop.load(std::memory_order_relaxed)) {
-                CH h;                                        // may mix fields of two epochs: valid() rejects those
+                CH h;                                        // may mix fields of two epochs: valid()/pin reject those
                 h.p   = reinterpret_cast<Canary*>(uintptr_t(pub_p.load(std::memory_order_acquire)));
                 h.idx = static_cast<decltype(h.idx)>(pub_idx.load(std::memory_order_acquire));
                 h.id  = static_cast<decltype(h.id)>(pub_id.load(std::memory_order_acquire));
-                Canary* r = h.get();
-                if (!r) { ++c.stale; continue; }
-                ++c.checks;
-                uint64_t a = r->a.load(std::memory_order_acquire), b = r->b.load(std::memory_order_acquire);
-                if (a != 0xAAAA || b != 0xAAAA) ++c.torn;
+                uint64_t a, b, a2, b2;
+                if (pinned) {
+#ifdef PPTR_HAS_PIN_GUARD
+                    pp::pin_guard<Canary> g(h);
+                    if (!g) { ++c.stale; continue; }
+                    ++c.checks;
+                    a = g->a.load(std::memory_order_acquire); b = g->b.load(std::memory_order_acquire);
+                    for (int k = 0; k < kHold; ++k) PPB_BARRIER();
+                    a2 = g->a.load(std::memory_order_acquire); b2 = g->b.load(std::memory_order_acquire);
+#else
+                    return;
+#endif
+                } else {
+                    Canary* r = h.get();
+                    if (!r) { ++c.stale; continue; }
+                    ++c.checks;
+                    a = r->a.load(std::memory_order_acquire); b = r->b.load(std::memory_order_acquire);
+                    for (int k = 0; k < kHold; ++k) PPB_BARRIER();
+                    a2 = r->a.load(std::memory_order_acquire); b2 = r->b.load(std::memory_order_acquire);
+                }
+                if (a != 0xAAAA || b != 0xAAAA || a2 != 0xAAAA || b2 != 0xAAAA) ++c.torn;
             }
         });
 
@@ -342,16 +395,27 @@ inline void race_test(int ms, int readers) {
 
     uint64_t checks = 0, stale = 0, torn = 0;
     for (auto& c : ctr) { checks += c.checks; stale += c.stale; torn += c.torn; }
-    S.torn = torn;
-    note("race canary: 1 writer + %d reader(s), %d ms", readers, ms);
-    note("  create+del cycles %llu, reads that passed valid() %llu, rejected %llu",
+    const char* kind = pinned ? "pinned (pin_guard)" : "unpinned (h.get())";
+    note("race canary, %s: 1 writer + %d reader(s), %d ms", kind, readers, ms);
+    note("  create+del cycles %llu, reads that got the object %llu, rejected %llu",
          (unsigned long long)replaced.load(), (unsigned long long)checks, (unsigned long long)stale);
     if (wfail) note("  writer: ptr<T>() returned empty %llu times (table exhausted)", (unsigned long long)wfail.load());
-    if (torn)
-        note("  TORN reads: %llu (%.3g per 1e9 checks) -> the check-then-use window is real; pin counter or deferred pm_free closes it",
-             (unsigned long long)torn, checks ? double(torn) * 1e9 / double(checks) : 0.0);
-    else
+    if (pinned) { S.torn_pin = torn; S.pin_checks = checks; } else S.torn = torn;
+    if (checks == 0) {
+        note("  INCONCLUSIVE: no read got the object, so this run proves nothing%s",
+             std::thread::hardware_concurrency() < 2 ? " (single hardware thread: readers and writer never overlap)" : "");
+    } else if (pinned) {
+        if (torn) note("  PIN FAILED: %llu torn reads out of %llu pinned reads (must be 0)",
+                       (unsigned long long)torn, (unsigned long long)checks);
+        else      note("  PIN OK: 0 torn reads out of %llu pinned reads (absence of hits is evidence, not a proof)",
+                       (unsigned long long)checks);
+    } else if (torn) {
+        note("  TORN reads: %llu = %.3g per 1e9 passed checks, %.3g per 1e9 attempts -> the check-then-use window is real",
+             (unsigned long long)torn, double(torn) * 1e9 / double(checks),
+             double(torn) * 1e9 / double(checks + stale));
+    } else {
         note("  torn reads: 0 -> no violation observed in this run (window is narrow; absence of hits is not a proof)");
+    }
 }
 
 // ------------------------------------------------------------------ main sequence
@@ -374,6 +438,8 @@ inline void bench_main() {
         set_current("done"); S.finished = true; S.running = false; return;
     }
 
+    if (std::thread::hardware_concurrency() < 2)
+        note("only %u hardware thread: multithreaded rows and the race tests are not meaningful", std::thread::hardware_concurrency());
     if (cap < 1024)
         note("table is tiny (%zu slots): working sets are L1-hot, and ptr<T>() scans slots linearly, so its cost grows with occupancy (see the batch rows)", cap);
 
@@ -391,7 +457,7 @@ inline void bench_main() {
     }
     const size_t shared_n = std::min<size_t>(cap, 4096);
     const bool do_shared = shared_n >= 16;
-    S.total = 1 + int(sizes.size()) * 5 + 3 + int(batch_sizes.size()) * 2 + 2 + (do_shared ? 2 : 0) + 1;
+    S.total = 1 + int(sizes.size()) * (5 + kPin) + 3 + int(batch_sizes.size()) * 2 + 2 + (do_shared ? 2 + kPin : 0) + 1 + kPin;
     ++S.step;                                                // probe done
 
     // 2. dereference cost
@@ -412,6 +478,9 @@ inline void bench_main() {
         run("h-> seq" + tag,          [&](size_t& o) { return trav_arrow(hs.data(), seq.data(), n, inner, o); }, ex);
         run("raw T* shuffled" + tag,  [&](size_t& o) { return trav_raw(raw.data(), shuf.data(), n, inner, o); }, ex);
         run("h-> shuffled" + tag,     [&](size_t& o) { return trav_arrow(hs.data(), shuf.data(), n, inner, o); }, ex);
+#ifdef PPTR_HAS_PIN_GUARD
+        run("pin_guard seq" + tag,    [&](size_t& o) { return trav_pin(hs.data(), seq.data(), n, inner, o); }, ex);
+#endif
     }
     for (auto& h : hs) if (h.p) pp_del(h);
     hs.clear(); hs.shrink_to_fit();
@@ -437,6 +506,9 @@ inline void bench_main() {
         std::vector<H> shs; std::vector<Obj*> srs;
         for (size_t i = 0; i < shared_n; ++i) { H h = pp_new(i); if (!h.p) break; shs.push_back(h); srs.push_back(h.p); }
         run("shared read h->" + tt,  [&](size_t& o) { return t_shared_arrow(shs, 10000000, o); }, "read-only, " + count_str(shs.size()) + " shared objects");
+#ifdef PPTR_HAS_PIN_GUARD
+        run("shared read pin_guard" + tt, [&](size_t& o) { return t_shared_pin(shs, 10000000, o); }, "read-only, fetch_add/fetch_sub on pins[idx]");
+#endif
         run("shared read raw T*" + tt, [&](size_t& o) { return t_shared_raw(srs, 10000000, o); });
         for (auto& h : shs) if (h.p) pp_del(h);
     }
@@ -446,8 +518,14 @@ inline void bench_main() {
     // 5. race canary
     if (!S.cancel) {
         set_current("race canary");
-        race_test(S.race_ms, std::max(1, S.threads - 1));
+        const int rdrs = std::max(1, S.threads - 1);
+        race_test(S.race_ms, rdrs, false);
         ++S.step;
+#ifdef PPTR_HAS_PIN_GUARD
+        if (!S.cancel) { set_current("race canary (pinned)"); race_test(S.race_ms, rdrs, true); ++S.step; }
+#else
+        note("pin_guard not found in the pmalloc header (PPTR_HAS_PIN_GUARD is not defined): pinned tests skipped");
+#endif
     }
     set_current(S.cancel ? "cancelled" : "done");
     S.finished = true;
@@ -481,7 +559,7 @@ inline bool start_pptr_bench(int reps = 5, int threads = 0, int race_ms = 1000) 
     S.threads = threads > 0 ? threads : (hw >= 8 ? 8 : (hw >= 2 ? int(hw) : 2));
     S.race_ms = race_ms < 100 ? 100 : race_ms;
     S.step = 0; S.total = 1;
-    S.cancel = false; S.finished = false; S.torn = 0; S.fails = 0;
+    S.cancel = false; S.finished = false; S.torn = 0; S.torn_pin = 0; S.pin_checks = 0; S.fails = 0;
     {
         std::lock_guard<std::mutex> lk(S.mx);
         S.rows.clear(); S.notes.clear(); S.current = "starting";
@@ -549,7 +627,7 @@ inline void pptr_bench_imgui() {
         ImGui::EndTable();
     }
     for (const auto& n : notes) {
-        if (n.find("TORN") != std::string::npos) ImGui::TextColored(ImVec4(1.f, 0.4f, 0.3f, 1.f), "%s", n.c_str());
+        if (n.find("TORN") != std::string::npos || n.find("PIN FAILED") != std::string::npos) ImGui::TextColored(ImVec4(1.f, 0.4f, 0.3f, 1.f), "%s", n.c_str());
         else ImGui::TextUnformatted(n.c_str());
     }
 #endif
