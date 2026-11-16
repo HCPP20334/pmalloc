@@ -2,11 +2,27 @@
 
 Высокопроизводительный slab-аллокатор памяти общего назначения с локальными TLS-кучами, lock-free очередью межпоточного освобождения и динамическим кэшем крупных сегментов. Разработан специально для игрового движка PahomEngine и требовательных системных сред на C++ и Rust.
 
-```
-Внимание! pmalloc_posix.hpp пока в активной доработке. Основной и максимально оптимизированный таргет на данный момент — Windows (pmalloc_win.hpp).
-```
+## pmalloc pointer
+безопасный указатель  с поддежкой многопоточности и защитой  от Use-After-Free and Double Free и Dangling pointer 
 
-Header-only, C++17, всё оформлено в `namespace pmalloc`. Подключайте `pmalloc_win.hpp` на Windows или `pmalloc_posix.hpp` на Linux/macOS. Линковать внешние зависимости не требуется.
+
+``` C++
+// create ptr
+
+pmalloc::pptr::handle<MyObj> obj = pmalloc::pptr::ptr<MyObj>();
+
+//and
+
+// using alias
+template <typename T>
+using pptr = pmalloc::pptr::handle<T>;
+pptr<MyObj> obj = pmalloc::pptr::ptr<MyObj>();
+
+// delete
+
+pmalloc::pptr::del(obj);
+```
+Header-only, C++20, всё оформлено в `namespace pmalloc`. Подключайте `pmalloc_win.hpp` на Windows или `pmalloc_posix.hpp` на Linux/macOS. Линковать внешние зависимости не требуется.
 
 ---
 
