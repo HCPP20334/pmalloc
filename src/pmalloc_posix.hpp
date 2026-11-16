@@ -729,133 +729,162 @@ struct pmallocator_cpp {
     template <typename U>
     bool operator!=(const pmallocator_cpp<U>&) const noexcept { return false; }
 };
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define PPTR_RETADDR() _ReturnAddress()
+#else
+#define PPTR_RETADDR() __builtin_return_address(0)
+#endif
+#define free_mem(p) pm_free(p)
+#define malloc_mem(p) pm_malloc(p)
+#define collect_mem() pm_collect()
 namespace pptr {
     constexpr uint64_t max_ptrs = 128;
-
     inline std::atomic<uint64_t> id_counter{ 1 };
-
     inline uint64_t set_id() {
         return id_counter.fetch_add(1, std::memory_order_relaxed);
     }
-
     struct ptr_data {
         std::array<std::atomic<void*>, max_ptrs>    addr{};
         std::array<std::atomic<uint64_t>, max_ptrs> id_ptr{};
+        std::array<std::atomic<uint32_t>, max_ptrs> pins{};
     };
-
     inline ptr_data ps;
-
     inline thread_local uint64_t tls_start_idx = 0;
-
-    inline std::atomic<void*> garbage_head{nullptr};
-
+    inline std::atomic<void*> garbage_head{ nullptr };
     inline void flush_garbage() {
         void* curr = garbage_head.exchange(nullptr, std::memory_order_acquire);
         while (curr) {
             void* next = *static_cast<void**>(curr);
-            pm_free(curr);
+            free_mem(curr);
             curr = next;
         }
     }
-
     template <typename T>
     struct handle {
         T* p = nullptr;
         uint64_t idx = 0;
         uint64_t id = 0;
-
         bool valid() const {
-            return p && id != 0 &&
+            return p && id != 0 && idx < max_ptrs &&
                 ps.id_ptr[idx].load(std::memory_order_acquire) == id &&
                 ps.addr[idx].load(std::memory_order_acquire) == static_cast<void*>(p);
         }
-
         T* get() const {
             return valid() ? p : nullptr;
         }
-
         T* operator->() const {
             T* r = get();
             if (!r) {
-                #ifdef _WIN32
-                std::fprintf(stderr, "pptr: UAF detected [ idx=%llu id=%llu, freed from %p ]\n", idx, id, _ReturnAddress());
+                #if defined(_WIN32)
+                void* base = (void*)GetModuleHandleW(nullptr);
+                std::fprintf(stderr,
+                    "pptr: UAF detected [ idx=%llu id=%llu, used from %p ]\nmodule base %p, rva 0x%llx\ncheck llvm-symbolizer --relative-address --obj=app.exe <rva>\n",
+                    (unsigned long long)idx, (unsigned long long)id, PPTR_RETADDR(), base,
+                    (unsigned long long)((char*)PPTR_RETADDR() - (char*)base));
                 #else
-                std::fprintf(stderr, "pptr: UAF detected [ idx=%llu id=%llu, freed from %p ]\n", idx, id, __builtin_return_address(0));
-                #endif
+                std::fprintf(stderr, "pptr: UAF detected [ idx=%llu id=%llu, used from %p ]\n",(unsigned long long)idx, (unsigned long long)id, PPTR_RETADDR());
                 std::printf("abort()!\n");
+                std::abort(); 
+                #endif
+                std::fflush(stderr);
                 std::abort();
             }
             return r;
         }
-        
         explicit operator bool() const { return valid(); }
         bool operator==(std::nullptr_t) const { return !valid(); }
         bool operator!=(std::nullptr_t) const { return valid(); }
     };
+    template <typename T>
+    class pin_guard {
+        T* p_ = nullptr;
+        uint64_t idx_ = 0;
+    public:
+        explicit pin_guard(const handle<T>& h) {
+            if (!h.p || h.id == 0 || h.idx >= max_ptrs) return;
 
+            ps.pins[h.idx].fetch_add(1, std::memory_order_seq_cst);   // 1. заявляем пин
+            if (ps.id_ptr[h.idx].load(std::memory_order_seq_cst) == h.id &&
+                ps.addr[h.idx].load(std::memory_order_seq_cst) == static_cast<void*>(h.p)) {  // 2. перепроверяем
+                p_ = h.p;
+                idx_ = h.idx;
+            }
+            else {
+                ps.pins[h.idx].fetch_sub(1, std::memory_order_release);
+            }
+        }
+        ~pin_guard() {
+            if (p_) ps.pins[idx_].fetch_sub(1, std::memory_order_release);
+        }
+        pin_guard(const pin_guard&) = delete;
+        pin_guard& operator=(const pin_guard&) = delete;
+        pin_guard(pin_guard&& o) noexcept : p_(o.p_), idx_(o.idx_) { o.p_ = nullptr; }
+
+        explicit operator bool() const { return p_ != nullptr; }
+        T* operator->() const { return p_; }
+        T& operator*()  const { return *p_; }
+    };
     template <typename T, typename... Args>
     handle<T> ptr(Args&&... args) {
-        void* mem = pm_malloc(sizeof(T));
+        constexpr size_t alloc_size =
+            sizeof(T) < sizeof(void*) ? sizeof(void*) : sizeof(T);
+        void* mem = malloc_mem(alloc_size);
         if (!mem) return {};
-
         uint64_t start = tls_start_idx;
-
         for (uint64_t i = start; i < start + max_ptrs; ++i) {
             uint64_t k = i % max_ptrs;
-            
             if (ps.addr[k].load(std::memory_order_relaxed) != nullptr) continue;
-
             void* expected = nullptr;
             if (ps.addr[k].compare_exchange_strong(expected, mem, std::memory_order_acq_rel)) {
                 T* obj;
                 try {
-                    obj = new (mem) T(std::forward<Args>(args)...);
+                    obj = std::construct_at(static_cast<T*>(mem), std::forward<Args>(args)...);
                 }
                 catch (...) {
                     ps.addr[k].store(nullptr, std::memory_order_release);
                     pm_free(mem);
                     throw;
                 }
-                
                 uint64_t id = set_id();
                 ps.id_ptr[k].store(id, std::memory_order_release);
-                
                 tls_start_idx = (k + 1) % max_ptrs;
-                
                 return { obj, k, id };
             }
         }
         pm_free(mem);
         return {};
     }
-
     template <typename T>
     bool del(handle<T>& h, uint8_t is_nullptr_set = 0, uint8_t is_collect = 0) {
-        if (!h.p) return false;
+        if (!h.p || h.idx >= max_ptrs) return false;
         uint64_t expected = h.id;
-        
-        if (!ps.id_ptr[h.idx].compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {
+        if (!ps.id_ptr[h.idx].compare_exchange_strong(
+            expected, 0, std::memory_order_seq_cst)) {
+                  #if defined(_WIN32)
+            void* base = (void*)GetModuleHandleW(nullptr);
+            std::fprintf(stderr, "pptr: Warn! After del call to Deleted pointer (Double Free) detected! return false rva=0x%llx module_stack_base=%p ptr=%p", (unsigned long long)((char*)PPTR_RETADDR() - (char*)base),base,h.get());
+          #else
+            std::fprintf(stderr, "pptr: Warn! After del call to Deleted pointer (Double Free) detected! return false addr=%p ptr=%p", PPTR_RETADDR(), h.get());
+#endif
             return false;
         }
-            
+        while (ps.pins[h.idx].load(std::memory_order_seq_cst) != 0)
+            std::this_thread::yield();
         T* obj = h.p;
-        
         if constexpr (!std::is_trivially_destructible_v<T>) {
             obj->~T();
         }
-        
         ps.addr[h.idx].store(nullptr, std::memory_order_release);
-        
         void* mem = static_cast<void*>(obj);
         void** node = static_cast<void**>(mem);
         void* old_head = garbage_head.load(std::memory_order_relaxed);
         do {
             *node = old_head;
-        } while (!garbage_head.compare_exchange_weak(old_head, mem, std::memory_order_release, std::memory_order_relaxed));
-        
-        if (is_collect) pm_collect();
+        } while (!garbage_head.compare_exchange_weak(
+            old_head, mem, std::memory_order_release, std::memory_order_relaxed));
+        if (is_collect) collect_mem();
         if (is_nullptr_set) h = {};
-        
         return true;
     }
 }
