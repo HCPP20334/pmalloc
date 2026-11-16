@@ -2,11 +2,28 @@
 
 High-performance general-purpose slab memory allocator featuring thread-local (TLS) heaps, a lock-free remote deallocation queue, and dynamic caching for large segments. Engineered specifically for PahomEngine and throughput-critical systems in C++ and Rust.
 
-```
-Warning: pmalloc_posix.hpp is actively being stabilized. The primary, highly tuned production target is currently Windows (pmalloc_win.hpp).
+## pmalloc pointer
+Safe pointer based on pmalloc and thread safe.
+with detected UAF and DF and Safe DP
+
+``` C++
+// create ptr
+
+pmalloc::pptr::handle<MyObj> obj = pmalloc::pptr::ptr<MyObj>();
+
+//and
+
+// using alias
+template <typename T>
+using pptr = pmalloc::pptr::handle<T>;
+pptr<MyObj> obj = pmalloc::pptr::ptr<MyObj>();
+
+// delete
+
+pmalloc::pptr::del(obj);
 ```
 
-Header-only, C++17, encapsulated within `namespace pmalloc`. Include `pmalloc_win.hpp` on Windows or `pmalloc_posix.hpp` on Linux/macOS. No external library linking required.
+Header-only, C++20, encapsulated within `namespace pmalloc`. Include `pmalloc_win.hpp` on Windows or `pmalloc_posix.hpp` on Linux/macOS. No external library linking required.
 
 ---
 
