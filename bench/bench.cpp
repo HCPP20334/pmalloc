@@ -28,22 +28,35 @@
 
 #if defined(USE_PM)
 #if defined(_WIN32)
-#include "../src/pmalloc_win.hpp"
+#include "pmalloc_win.hpp"
 #else
-#include "../src/pmalloc_posix.hpp"
+#include "pmalloc_posix.hpp"
 #endif
 #define NAME "pmalloc"
 NOINLINE static void* A(size_t n) { return pmalloc::pm_malloc(n); }
-NOINLINE static void  F(void* p) { pmalloc::pm_free(p); }
+NOINLINE static void  F(void* p)  { pmalloc::pm_free(p); }
+#elif defined(USE_JE)
+extern "C" void* mallocx(size_t, int);
+extern "C" void  dallocx(void*, int);
+#define NAME "jemalloc"
+NOINLINE static void* A(size_t n) { return mallocx(n, 0); }
+NOINLINE static void  F(void* p)  { dallocx(p, 0); }
+#elif defined(USE_TC)
+extern "C" void* tc_malloc(size_t);
+extern "C" void  tc_free(void*);
+#define NAME "tcmalloc"
+NOINLINE static void* A(size_t n) { return tc_malloc(n); }
+NOINLINE static void  F(void* p)  { tc_free(p); }
 #elif defined(USE_MI)
-extern "C" void* mi_malloc(size_t); extern "C" void mi_free(void*);
+extern "C" void* mi_malloc(size_t);
+extern "C" void  mi_free(void*);
 #define NAME "mimalloc"
 NOINLINE static void* A(size_t n) { return mi_malloc(n); }
-NOINLINE static void  F(void* p) { mi_free(p); }
+NOINLINE static void  F(void* p)  { mi_free(p); }
 #else
-#define NAME "crt malloc"
+#define NAME "glibc"
 NOINLINE static void* A(size_t n) { return std::malloc(n); }
-NOINLINE static void  F(void* p) { std::free(p); }
+NOINLINE static void  F(void* p)  { std::free(p); }
 #endif
 
 

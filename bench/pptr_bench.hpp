@@ -56,9 +56,9 @@
 #define PPTR_HAS_PIN_GUARD // safe mode 
 #ifndef PPTR_BENCH_HEADER
 #if defined(_WIN32)
-#define PPTR_BENCH_HEADER "../src/pmalloc_win.hpp"
+#define PPTR_BENCH_HEADER "pmalloc_win.hpp"
 #else
-#define PPTR_BENCH_HEADER "../src/pmalloc_posix.hpp"
+#define PPTR_BENCH_HEADER "pmalloc_posix.hpp"
 #endif
 #endif
 #include PPTR_BENCH_HEADER

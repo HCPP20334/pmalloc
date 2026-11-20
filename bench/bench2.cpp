@@ -18,13 +18,13 @@
 #include <random>
 #include <thread>
 #include <vector>
-
+#include <array>
 #if defined(_WIN32)
-#include "../src/pmalloc_win.hpp"
+#include "pmalloc_win.hpp"
 #else
-#include "../src/pmalloc_posix.hpp"
+#include "pmalloc_posix.hpp"
 #endif
-#include "../src/pmalloc_x3d.hpp"
+#include "pmalloc_x3d.hpp"
 
 #if defined(_MSC_VER)
 #define NOINLINE __declspec(noinline)
