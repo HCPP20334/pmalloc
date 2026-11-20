@@ -7,6 +7,12 @@
 
 
 ``` C++
+struct MyObj{
+
+int MyVal = 255;
+int foo(int a,int b){return a + b;}
+
+};
 // create ptr
 
 pmalloc::pptr::handle<MyObj> obj = pmalloc::pptr::ptr<MyObj>();
@@ -18,9 +24,29 @@ template <typename T>
 using pptr = pmalloc::pptr::handle<T>;
 pptr<MyObj> obj = pmalloc::pptr::ptr<MyObj>();
 
+ int v  = obj->MyVal; // 255
+ int r = obj->foo(obj->MyVal,100);// 355
 // delete
 
 pmalloc::pptr::del(obj);
+
+
+// thread-safe 
+using pptr = pmalloc::pptr::handle<MyObj>;
+
+pptr<MyObj> obj = pmalloc::pptr::ptr<MyObj>();
+if (!obj) return;                          // table full
+
+{
+    pmalloc::pptr::pin_guard<MyObj> ObjG{obj};
+    if (!ObjG) return;                     // obj delected
+
+    int v  = ObjG->MyVal;                  // 255
+    int r  = ObjG->foo(v, 100);            // 355
+    // ... jobs ...
+}                                          // unpinned
+
+pmalloc::pptr::del(obj);                    // delete
 ```
 Header-only, C++20, всё оформлено в `namespace pmalloc`. Подключайте `pmalloc_win.hpp` на Windows или `pmalloc_posix.hpp` на Linux/macOS. Линковать внешние зависимости не требуется.
 
