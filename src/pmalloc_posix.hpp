@@ -12,7 +12,21 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
-
+#include <array>
+#include <immintrin.h>
+#include <memory>
+#include <thread>
+#include <array>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define PPTR_RETADDR() _ReturnAddress()
+#else
+#define PPTR_RETADDR() __builtin_return_address(0)
+#endif
+#define free_mem(p) pm_free(p)
+#define malloc_mem(p) pm_malloc(p)
+#define collect_mem() pm_collect()
+#include <cstdio>
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
 #endif
@@ -28,7 +42,7 @@
 #else
 #define PM_NOINLINE __attribute__((noinline))
 #endif
-
+#include <dlfcn.h>
 namespace pmalloc {
 
 constexpr std::size_t kSegmentSize   = 64 * 1024;
@@ -729,163 +743,383 @@ struct pmallocator_cpp {
     template <typename U>
     bool operator!=(const pmallocator_cpp<U>&) const noexcept { return false; }
 };
-#if defined(_MSC_VER)
-#include <intrin.h>
+/*
+ pptr - pmalloc pointer
+ safe ptr detect - (UAF,DF,DP)
+ Memory Leak comming soon...
+
+ Drop-in replacement for the `namespace pptr { ... }` block inside
+ namespace pmalloc.
+
+ Needed ABOVE this block (top of pmalloc_win.hpp / pmalloc_posix.hpp):
+   <atomic> <array> <cstdint> <cstdio> <cstdlib> <memory> <new> <thread>
+   <type_traits> <immintrin.h>
+   POSIX:   <dlfcn.h>        (glibc < 2.34: link with -ldl)
+   Windows: <windows.h> <intrin.h>
+ Needed from the allocator: malloc_mem(size_t), free_mem(void*), collect_mem()
+
+ Build with -g so the printed rva can be resolved:
+   addr2line -fCe ./app 0x<rva>
+   llvm-symbolizer --relative-address --obj=./app 0x<rva>
+*/
+
+#ifndef PPTR_RETADDR
+#if defined(_MSC_VER) && !defined(__clang__)
 #define PPTR_RETADDR() _ReturnAddress()
 #else
 #define PPTR_RETADDR() __builtin_return_address(0)
 #endif
-#define free_mem(p) pm_free(p)
-#define malloc_mem(p) pm_malloc(p)
-#define collect_mem() pm_collect()
-namespace pptr {
-    constexpr uint64_t max_ptrs = 128;
-    inline std::atomic<uint64_t> id_counter{ 1 };
-    inline uint64_t set_id() {
-        return id_counter.fetch_add(1, std::memory_order_relaxed);
-    }
-    struct ptr_data {
-        std::array<std::atomic<void*>, max_ptrs>    addr{};
-        std::array<std::atomic<uint64_t>, max_ptrs> id_ptr{};
-        std::array<std::atomic<uint32_t>, max_ptrs> pins{};
-    };
-    inline ptr_data ps;
-    inline thread_local uint64_t tls_start_idx = 0;
-    inline std::atomic<void*> garbage_head{ nullptr };
-    inline void flush_garbage() {
-        void* curr = garbage_head.exchange(nullptr, std::memory_order_acquire);
-        while (curr) {
-            void* next = *static_cast<void**>(curr);
-            free_mem(curr);
-            curr = next;
-        }
-    }
-    template <typename T>
-    struct handle {
-        T* p = nullptr;
-        uint64_t idx = 0;
-        uint64_t id = 0;
-        bool valid() const {
-            return p && id != 0 && idx < max_ptrs &&
-                ps.id_ptr[idx].load(std::memory_order_acquire) == id &&
-                ps.addr[idx].load(std::memory_order_acquire) == static_cast<void*>(p);
-        }
-        T* get() const {
-            return valid() ? p : nullptr;
-        }
-        T* operator->() const {
-            T* r = get();
-            if (!r) {
-                #if defined(_WIN32)
-                void* base = (void*)GetModuleHandleW(nullptr);
-                std::fprintf(stderr,
-                    "pptr: UAF detected [ idx=%llu id=%llu, used from %p ]\nmodule base %p, rva 0x%llx\ncheck llvm-symbolizer --relative-address --obj=app.exe <rva>\n",
-                    (unsigned long long)idx, (unsigned long long)id, PPTR_RETADDR(), base,
-                    (unsigned long long)((char*)PPTR_RETADDR() - (char*)base));
-                #else
-                std::fprintf(stderr, "pptr: UAF detected [ idx=%llu id=%llu, used from %p ]\n",(unsigned long long)idx, (unsigned long long)id, PPTR_RETADDR());
-                std::printf("abort()!\n");
-                std::abort(); 
-                #endif
-                std::fflush(stderr);
-                std::abort();
-            }
-            return r;
-        }
-        explicit operator bool() const { return valid(); }
-        bool operator==(std::nullptr_t) const { return !valid(); }
-        bool operator!=(std::nullptr_t) const { return valid(); }
-    };
-    template <typename T>
-    class pin_guard {
-        T* p_ = nullptr;
-        uint64_t idx_ = 0;
-    public:
-        explicit pin_guard(const handle<T>& h) {
-            if (!h.p || h.id == 0 || h.idx >= max_ptrs) return;
-
-            ps.pins[h.idx].fetch_add(1, std::memory_order_seq_cst);   // 1. заявляем пин
-            if (ps.id_ptr[h.idx].load(std::memory_order_seq_cst) == h.id &&
-                ps.addr[h.idx].load(std::memory_order_seq_cst) == static_cast<void*>(h.p)) {  // 2. перепроверяем
-                p_ = h.p;
-                idx_ = h.idx;
-            }
-            else {
-                ps.pins[h.idx].fetch_sub(1, std::memory_order_release);
-            }
-        }
-        ~pin_guard() {
-            if (p_) ps.pins[idx_].fetch_sub(1, std::memory_order_release);
-        }
-        pin_guard(const pin_guard&) = delete;
-        pin_guard& operator=(const pin_guard&) = delete;
-        pin_guard(pin_guard&& o) noexcept : p_(o.p_), idx_(o.idx_) { o.p_ = nullptr; }
-
-        explicit operator bool() const { return p_ != nullptr; }
-        T* operator->() const { return p_; }
-        T& operator*()  const { return *p_; }
-    };
-    template <typename T, typename... Args>
-    handle<T> ptr(Args&&... args) {
-        constexpr size_t alloc_size =
-            sizeof(T) < sizeof(void*) ? sizeof(void*) : sizeof(T);
-        void* mem = malloc_mem(alloc_size);
-        if (!mem) return {};
-        uint64_t start = tls_start_idx;
-        for (uint64_t i = start; i < start + max_ptrs; ++i) {
-            uint64_t k = i % max_ptrs;
-            if (ps.addr[k].load(std::memory_order_relaxed) != nullptr) continue;
-            void* expected = nullptr;
-            if (ps.addr[k].compare_exchange_strong(expected, mem, std::memory_order_acq_rel)) {
-                T* obj;
-                try {
-                    obj = std::construct_at(static_cast<T*>(mem), std::forward<Args>(args)...);
-                }
-                catch (...) {
-                    ps.addr[k].store(nullptr, std::memory_order_release);
-                    pm_free(mem);
-                    throw;
-                }
-                uint64_t id = set_id();
-                ps.id_ptr[k].store(id, std::memory_order_release);
-                tls_start_idx = (k + 1) % max_ptrs;
-                return { obj, k, id };
-            }
-        }
-        pm_free(mem);
-        return {};
-    }
-    template <typename T>
-    bool del(handle<T>& h, uint8_t is_nullptr_set = 0, uint8_t is_collect = 0) {
-        if (!h.p || h.idx >= max_ptrs) return false;
-        uint64_t expected = h.id;
-        if (!ps.id_ptr[h.idx].compare_exchange_strong(
-            expected, 0, std::memory_order_seq_cst)) {
-                  #if defined(_WIN32)
-            void* base = (void*)GetModuleHandleW(nullptr);
-            std::fprintf(stderr, "pptr: Warn! After del call to Deleted pointer (Double Free) detected! return false rva=0x%llx module_stack_base=%p ptr=%p", (unsigned long long)((char*)PPTR_RETADDR() - (char*)base),base,h.get());
-          #else
-            std::fprintf(stderr, "pptr: Warn! After del call to Deleted pointer (Double Free) detected! return false addr=%p ptr=%p", PPTR_RETADDR(), h.get());
 #endif
-            return false;
-        }
-        while (ps.pins[h.idx].load(std::memory_order_seq_cst) != 0)
-            std::this_thread::yield();
-        T* obj = h.p;
-        if constexpr (!std::is_trivially_destructible_v<T>) {
-            obj->~T();
-        }
-        ps.addr[h.idx].store(nullptr, std::memory_order_release);
-        void* mem = static_cast<void*>(obj);
-        void** node = static_cast<void**>(mem);
-        void* old_head = garbage_head.load(std::memory_order_relaxed);
-        do {
-            *node = old_head;
-        } while (!garbage_head.compare_exchange_weak(
-            old_head, mem, std::memory_order_release, std::memory_order_relaxed));
-        if (is_collect) collect_mem();
-        if (is_nullptr_set) h = {};
-        return true;
-    }
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#define PPTR_COLD __declspec(noinline)
+#else
+#define PPTR_COLD __attribute__((noinline, cold))
+#endif
+
+namespace pptr {
+constexpr uint64_t max_ptrs = 4096;
+constexpr uint32_t empty_slot = 0xFFFFFFFFu;
+
+// set to false to silence the double-free warning (stress tests)
+inline std::atomic<bool> warn_double_free{true};
+
+inline void cpu_relax() {
+#if (defined(_MSC_VER) || defined(__clang__)) &&                               \
+    (defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||             \
+     defined(__i386__))
+  _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  asm volatile("yield");
+#else
+  std::this_thread::yield();
+#endif
 }
+
+inline uint32_t get_thread_id() {
+  static std::atomic<uint32_t> counter{1};
+  thread_local uint32_t id = counter.fetch_add(1, std::memory_order_relaxed);
+  return id;
+}
+
+inline thread_local uint64_t tls_local_id = 0;
+inline thread_local uint32_t tls_thread_id = get_thread_id();
+
+// high 32 bits = thread, low 32 bits = per-thread counter.
+// The counter is masked so wrap-around can never leak into the thread bits
+// (thread id is never 0, so the id is never 0).
+inline uint64_t set_id() {
+  return (uint64_t(tls_thread_id) << 32) | uint32_t(++tls_local_id);
+}
+
+// ---- module base / rva (same output on Windows and POSIX) -----------------
+struct site {
+  void *base;
+  unsigned long long rva;
+  const char *path;
+};
+
+inline site locate(void *addr) {
+#if defined(_WIN32)
+  void *base = (void *)GetModuleHandleW(nullptr);
+  return {base, (unsigned long long)((char *)addr - (char *)base), "app.exe"};
+#else
+  Dl_info di{};
+  if (dladdr(addr, &di) && di.dli_fbase) {
+    return {di.dli_fbase,
+            (unsigned long long)((char *)addr - (char *)di.dli_fbase),
+            di.dli_fname ? di.dli_fname : "app"};
+  }
+  return {nullptr, (unsigned long long)(uintptr_t)addr, "app"};
+#endif
+}
+
+[[noreturn]] PPTR_COLD inline void report_uaf(uint64_t idx, uint64_t id,
+                                              void *ra) {
+  site s = locate(ra);
+  std::fprintf(stderr,
+               "pptr: UAF detected [ idx=%llu id=%llu, used from %p ]\n"
+               "module base %p, rva 0x%llx\n"
+               "check llvm-symbolizer --relative-address --obj=%s <rva>\n",
+               (unsigned long long)idx, (unsigned long long)id, ra, s.base,
+               s.rva, s.path);
+  std::fflush(stderr);
+  std::abort();
+}
+
+PPTR_COLD inline void report_double_free(void *ra, void *p) {
+  if (!warn_double_free.load(std::memory_order_relaxed))
+    return;
+  site s = locate(ra);
+  std::fprintf(
+      stderr,
+      "pptr: Warn! After del call to Deleted pointer (Double Free) detected! "
+      "return false rva=0x%llx module_stack_base=%p ptr=%p\n",
+      s.rva, s.base, p);
+}
+
+// ---- slot table -----------------------------------------------------------
+// One slot per cache line: threads working on different slots never share a
+// line, and valid() touches a single line instead of two arrays.
+struct alignas(64) slot {
+  std::atomic<void *> addr{nullptr};
+  std::atomic<uint64_t> id{0};
+  std::atomic<uint32_t> pins{0};
+  std::atomic<uint32_t> next_free{empty_slot};
+};
+
+struct ptr_data {
+  alignas(64) std::atomic<uint64_t> free_head{0};
+  std::array<slot, max_ptrs> slots{};
+
+  ptr_data() {
+    for (uint32_t i = 0; i + 1 < max_ptrs; ++i) {
+      slots[i].next_free.store(i + 1, std::memory_order_relaxed);
+    }
+    slots[max_ptrs - 1].next_free.store(empty_slot, std::memory_order_relaxed);
+    free_head.store(0, std::memory_order_release);
+  }
+
+  uint32_t pop_slot() {
+    uint64_t old_head = free_head.load(std::memory_order_acquire);
+    while (true) {
+      uint32_t idx = static_cast<uint32_t>(old_head);
+      if (idx == empty_slot)
+        return empty_slot;
+      uint32_t next = slots[idx].next_free.load(std::memory_order_relaxed);
+      uint64_t new_head =
+          (uint64_t(static_cast<uint32_t>(old_head >> 32) + 1) << 32) | next;
+      if (free_head.compare_exchange_weak(old_head, new_head,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+        return idx;
+      }
+    }
+  }
+
+  void push_slot(uint32_t idx) {
+    uint64_t old_head = free_head.load(std::memory_order_relaxed);
+    while (true) {
+      uint32_t old_idx = static_cast<uint32_t>(old_head);
+      slots[idx].next_free.store(old_idx, std::memory_order_relaxed);
+      uint64_t new_head =
+          (uint64_t(static_cast<uint32_t>(old_head >> 32) + 1) << 32) | idx;
+      if (free_head.compare_exchange_weak(old_head, new_head,
+                                          std::memory_order_release,
+                                          std::memory_order_relaxed)) {
+        return;
+      }
+    }
+  }
+};
+
+inline ptr_data ps;
+
+struct tls_cache {
+  static constexpr uint32_t cap = 8;
+  uint32_t slots[cap]{};
+  uint32_t count = 0;
+
+  ~tls_cache() {
+    while (count > 0) {
+      ps.push_slot(slots[--count]);
+    }
+  }
+};
+
+inline thread_local tls_cache tls_free;
+
+inline uint32_t alloc_slot() {
+  if (tls_free.count > 0) {
+    return tls_free.slots[--tls_free.count];
+  }
+  return ps.pop_slot();
+}
+
+inline void free_slot(uint32_t idx) {
+  if (tls_free.count < tls_cache::cap) {
+    tls_free.slots[tls_free.count++] = idx;
+    return;
+  }
+  ps.push_slot(idx);
+}
+
+// Deferred frees. The destructor flushes the list when the thread exits, so
+// up to 511 blocks per thread are no longer leaked.
+// (Requires free_mem to be callable during thread teardown.)
+struct tls_garbage {
+  void *head = nullptr;
+  uint32_t count = 0;
+
+  void flush() {
+    void *curr = head;
+    while (curr) {
+      void *next = *static_cast<void **>(curr);
+      free_mem(curr);
+      curr = next;
+    }
+    head = nullptr;
+    count = 0;
+  }
+
+  ~tls_garbage() { flush(); }
+};
+
+inline thread_local tls_garbage tls_garb;
+
+inline void flush_garbage() { tls_garb.flush(); }
+
+// ---- handle ---------------------------------------------------------------
+template <typename T> struct handle {
+  T *p = nullptr;
+  uint64_t idx = 0;
+  uint64_t id = 0;
+
+  bool valid() const {
+    if (!p || id == 0 || idx >= max_ptrs)
+      return false;
+    const slot &s = ps.slots[idx];
+    return s.id.load(std::memory_order_acquire) == id &&
+           s.addr.load(std::memory_order_acquire) == static_cast<void *>(p);
+  }
+
+  T *get() const { return valid() ? p : nullptr; }
+
+  T *operator->() const {
+    T *r = get();
+    if (!r)
+      report_uaf(idx, id, PPTR_RETADDR());
+    return r;
+  }
+
+  explicit operator bool() const { return valid(); }
+  bool operator==(std::nullptr_t) const { return !valid(); }
+  bool operator!=(std::nullptr_t) const { return valid(); }
+};
+
+// ---- pin_guard ------------------------------------------------------------
+// Pin protocol (Dekker style, needs seq_cst on both sides):
+//   reader: pins++            ; load id
+//   del   : CAS id -> 0       ; load pins
+// With weaker orders both sides may read stale values on weakly ordered
+// CPUs and the object would be freed under a reader.
+template <typename T> class pin_guard {
+  T *p_ = nullptr;
+  uint64_t idx_ = 0;
+
+public:
+  explicit pin_guard(const handle<T> &h) {
+    if (!h.p || h.id == 0 || h.idx >= max_ptrs)
+      return;
+
+    slot &s = ps.slots[h.idx];
+
+    // cheap reject: avoid two RMWs on a slot that is already dead
+    if (s.id.load(std::memory_order_acquire) != h.id)
+      return;
+
+    s.pins.fetch_add(1, std::memory_order_seq_cst);
+    if (s.id.load(std::memory_order_seq_cst) == h.id &&
+        s.addr.load(std::memory_order_acquire) == static_cast<void *>(h.p)) {
+      p_ = h.p;
+      idx_ = h.idx;
+    } else {
+      s.pins.fetch_sub(1, std::memory_order_release);
+    }
+  }
+
+  ~pin_guard() {
+    if (p_)
+      ps.slots[idx_].pins.fetch_sub(1, std::memory_order_release);
+  }
+
+  pin_guard(const pin_guard &) = delete;
+  pin_guard &operator=(const pin_guard &) = delete;
+  pin_guard(pin_guard &&o) noexcept : p_(o.p_), idx_(o.idx_) { o.p_ = nullptr; }
+
+  explicit operator bool() const { return p_ != nullptr; }
+  T *operator->() const { return p_; }
+  T &operator*() const { return *p_; }
+};
+
+// ---- create / delete ------------------------------------------------------
+template <typename T, typename... Args> handle<T> ptr(Args &&...args) {
+  uint32_t k = alloc_slot();
+  if (k == empty_slot)
+    return {};
+
+  constexpr size_t alloc_size =
+      sizeof(T) < sizeof(void *) ? sizeof(void *) : sizeof(T);
+  void *mem = malloc_mem(alloc_size);
+  if (!mem) {
+    free_slot(k);
+    return {};
+  }
+
+  T *obj;
+  try {
+    obj = std::construct_at(static_cast<T *>(mem), std::forward<Args>(args)...);
+  } catch (...) {
+    free_mem(mem);
+    free_slot(k);
+    throw;
+  }
+
+  uint64_t id = set_id();
+  slot &s = ps.slots[k];
+  s.addr.store(mem, std::memory_order_release);
+  s.id.store(id, std::memory_order_release); // publishes the object
+  return {obj, k, id};
+}
+
+// NOTE: calling del() on an object this same thread has pinned waits forever.
+template <typename T>
+bool del(handle<T> &h, uint8_t is_nullptr_set = 0, uint8_t is_collect = 0) {
+  if (!h.p || h.id == 0 || h.idx >= max_ptrs)
+    return false;
+
+  slot &s = ps.slots[h.idx];
+  uint64_t expected = h.id;
+  if (!s.id.compare_exchange_strong(expected, 0, std::memory_order_seq_cst,
+                                    std::memory_order_seq_cst)) {
+    report_double_free(PPTR_RETADDR(), h.get());
+    return false;
+  }
+
+  // id is 0 now: no new pin can succeed, wait for the ones already taken
+  for (uint32_t spins = 0; s.pins.load(std::memory_order_seq_cst) != 0;
+       ++spins) {
+    if (spins < 1024)
+      cpu_relax();
+    else
+      std::this_thread::yield();
+  }
+
+  T *obj = h.p;
+  if constexpr (!std::is_trivially_destructible_v<T>) {
+    obj->~T();
+  }
+  s.addr.store(nullptr, std::memory_order_release);
+  free_slot(static_cast<uint32_t>(h.idx));
+
+  void *mem = static_cast<void *>(obj);
+  *static_cast<void **>(mem) = tls_garb.head;
+  tls_garb.head = mem;
+
+  if (++tls_garb.count >= 512) {
+    flush_garbage();
+  }
+
+  if (is_collect) {
+    flush_garbage();
+    collect_mem();
+  }
+
+  if (is_nullptr_set)
+    h = {};
+  return true;
+}
+} // namespace pptr
 }
